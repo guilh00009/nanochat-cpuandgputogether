@@ -1,0 +1,18 @@
+// For format details, see https://aka.ms/devcontainer.json.
+{
+	"name": "Ubuntu",
+	"image": "mcr.microsoft.com/devcontainers/base:noble",
+
+	// Features to add to the dev container. More info: https://containers.dev/features.
+	"features": {
+		// CUDA support with GPU passthrough
+		"ghcr.io/devcontainers/features/nvidia-cuda:2": {}
+
+		// Everythong else gets installed automatically by uv
+	},
+
+	// Pass-through the GPU for CUDA if one is available
+	"hostRequirements": {
+		"gpu": "optional" 
+	}
+}
