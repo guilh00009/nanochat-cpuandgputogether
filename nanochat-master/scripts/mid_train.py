@@ -124,6 +124,29 @@ if master_process and not dry_run and os.path.isdir(checkpoint_dir):
         for stale_step in existing_steps[:-1]:
             delete_checkpoint_files(checkpoint_dir, stale_step)
 
+last_val_bpb = None
+
+def save_mid_checkpoint(step_to_save):
+    save_checkpoint(
+        checkpoint_dir,
+        step_to_save,
+        orig_model.state_dict(),
+        [opt.state_dict() for opt in optimizers],
+        {
+            "step": step_to_save,
+            "val_bpb": last_val_bpb,
+            "model_config": {
+                "sequence_len": max_seq_len,
+                "vocab_size": tokenizer.get_vocab_size(),
+                "n_layer": depth,
+                "n_head": model.config.n_head,
+                "n_kv_head": model.config.n_kv_head,
+                "n_embd": model.config.n_embd,
+            },
+            "user_config": user_config,
+        }
+    )
+
 identity_conversations_filepath = os.path.join(base_dir, "identity_conversations.jsonl")
 train_dataset = TaskMixture([
     SmolTalk(split="train"), # 460K rows of general conversations
@@ -208,7 +231,6 @@ smooth_train_loss = 0 # EMA of training loss
 ema_beta = 0.9 # EMA decay factor
 total_training_time = 0 # total wall-clock time of training
 step = 0
-last_val_bpb = None
 last_checkpoint_step = initial_last_checkpoint_step
 while True:
     flops_so_far = num_flops_per_token * total_batch_size * step
@@ -299,25 +321,7 @@ while True:
         if save_due_to_interval or save_due_to_last_step:
             if last_checkpoint_step is not None and last_checkpoint_step != step:
                 delete_checkpoint_files(checkpoint_dir, last_checkpoint_step)
-            save_checkpoint(
-                checkpoint_dir,
-                step,
-                orig_model.state_dict(),
-                [opt.state_dict() for opt in optimizers], # TODO: make sure saving across ranks is done correctly
-                {
-                    "step": step,
-                    "val_bpb": last_val_bpb,
-                    "model_config": {
-                        "sequence_len": max_seq_len,
-                        "vocab_size": tokenizer.get_vocab_size(),
-                        "n_layer": depth,
-                        "n_head": model.config.n_head,
-                        "n_kv_head": model.config.n_kv_head,
-                        "n_embd": model.config.n_embd,
-                    },
-                    "user_config": user_config,
-                }
-            )
+            save_mid_checkpoint(step)
             last_checkpoint_step = step
 
     if last_step:

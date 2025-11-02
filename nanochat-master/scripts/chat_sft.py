@@ -188,6 +188,20 @@ for opt in optimizers:
         group["lr"] = group["lr"] * init_lr_frac
         group["initial_lr"] = group["lr"] # save the initial learning so we can decay easily later
 
+def save_chat_checkpoint(step_to_save):
+    save_checkpoint(
+        checkpoint_dir,
+        step_to_save,
+        model.state_dict(),
+        [opt.state_dict() for opt in optimizers],
+        {
+            "step": step_to_save,
+            "val_loss": last_val_loss,
+            **last_metrics,
+            "model_config": dict(model.config.__dict__),
+        }
+    )
+
 # -----------------------------------------------------------------------------
 # Training loop
 
@@ -247,18 +261,7 @@ for step in range(num_iterations):
     if master_process and last_step:
         if last_checkpoint_step is not None and last_checkpoint_step != step:
             delete_checkpoint_files(checkpoint_dir, last_checkpoint_step)
-        save_checkpoint(
-            checkpoint_dir,
-            step,
-            model.state_dict(),
-            None,
-            {
-                "step": step,
-                "val_loss": last_val_loss,
-                **last_metrics,
-                "model_config": dict(model.config.__dict__),
-            }
-        )
+        save_chat_checkpoint(step)
         last_checkpoint_step = step
 
     if last_step:
@@ -302,18 +305,7 @@ for step in range(num_iterations):
     if master_process and checkpoint_every > 0 and step > 0 and step % checkpoint_every == 0:
         if last_checkpoint_step is not None and last_checkpoint_step != step:
             delete_checkpoint_files(checkpoint_dir, last_checkpoint_step)
-        save_checkpoint(
-            checkpoint_dir,
-            step,
-            model.state_dict(),
-            None,
-            {
-                "step": step,
-                "val_loss": last_val_loss,
-                **last_metrics,
-                "model_config": dict(model.config.__dict__),
-            }
-        )
+        save_chat_checkpoint(step)
         last_checkpoint_step = step
 
     step += 1
@@ -323,18 +315,7 @@ if master_process:
     if last_checkpoint_step != step:
         if last_checkpoint_step is not None and last_checkpoint_step != step:
             delete_checkpoint_files(checkpoint_dir, last_checkpoint_step)
-        save_checkpoint(
-            checkpoint_dir,
-            step,
-            model.state_dict(),
-            None, # note: we don't bother to save the optimizer state
-            {
-                "step": step,
-                "val_loss": last_val_loss,
-                **last_metrics,
-                "model_config": dict(model.config.__dict__),
-            }
-        )
+        save_chat_checkpoint(step)
         last_checkpoint_step = step
     print(f"Saved model checkpoint to {checkpoint_dir}")
 # Log to report
