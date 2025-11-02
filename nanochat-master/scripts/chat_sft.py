@@ -55,6 +55,7 @@ eval_every = 100
 eval_steps = 100
 eval_metrics_every = 200
 eval_metrics_max_problems = 1024
+checkpoint_every = 450
 # now allow CLI to override the settings via the configurator lol
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open(os.path.join('nanochat', 'configurator.py')).read()) # overrides from command line or config file
@@ -77,10 +78,40 @@ model, tokenizer, meta = load_model(source, device, phase="train", model_tag=mod
 orig_model = model # original, uncompiled model
 # model = torch.compile(model, dynamic=True) # doesn't work super well because of variable lengths of inputs
 engine = Engine(model, tokenizer) # will be used for inline model evaluation only
+depth = model.config.n_layer
+base_dir = get_base_dir()
+checkpoint_subdir = f"d{depth}"
+checkpoint_dir = os.path.join(base_dir, "checkpoints", "sft_checkpoints", checkpoint_subdir)
+
+def delete_checkpoint_files(checkpoint_root, step_to_remove):
+    if step_to_remove is None:
+        return
+    model_path = os.path.join(checkpoint_root, f"model_{step_to_remove:06d}.pt")
+    optim_path = os.path.join(checkpoint_root, f"optim_{step_to_remove:06d}.pt")
+    meta_path = os.path.join(checkpoint_root, f"meta_{step_to_remove:06d}.json")
+    for path in (model_path, optim_path, meta_path):
+        if os.path.exists(path):
+            os.remove(path)
+
+initial_last_checkpoint_step = None
+if master_process and os.path.isdir(checkpoint_dir):
+    existing_steps = []
+    for filename in os.listdir(checkpoint_dir):
+        if filename.startswith("model_") and filename.endswith(".pt"):
+            try:
+                step_str = filename.split("_", 1)[1].rsplit(".", 1)[0]
+                existing_steps.append(int(step_str))
+            except (IndexError, ValueError):
+                continue
+    if existing_steps:
+        existing_steps.sort()
+        initial_last_checkpoint_step = existing_steps[-1]
+        for stale_step in existing_steps[:-1]:
+            delete_checkpoint_files(checkpoint_dir, stale_step)
 
 # -----------------------------------------------------------------------------
 # Task data mixture we'll train on
-identity_conversations_filepath = os.path.join(get_base_dir(), "identity_conversations.jsonl")
+identity_conversations_filepath = os.path.join(base_dir, "identity_conversations.jsonl")
 train_ds = TaskMixture([
     ARC(subset="ARC-Easy", split="train"), # 2.3K rows
     ARC(subset="ARC-Challenge", split="train"), # 1.1K rows
@@ -168,6 +199,9 @@ def get_lr_multiplier(it):
 # Go!
 step = 0
 train_iter = iter(train_loader)
+last_val_loss = None
+last_metrics = {}
+last_checkpoint_step = initial_last_checkpoint_step
 for step in range(num_iterations):
     last_step = step == num_iterations - 1
 
@@ -185,6 +219,7 @@ for step in range(num_iterations):
         if ddp:
             dist.all_reduce(val_loss, op=dist.ReduceOp.AVG) # average over ranks
         val_loss = val_loss.item()
+        last_val_loss = val_loss
         print0(f"Step {step:05d} | Validation loss: {val_loss:.6f}")
         wandb_run.log({
             "step": step,
@@ -201,12 +236,30 @@ for step in range(num_iterations):
             metrics["mmlu_acc"] = run_chat_eval("MMLU", model, tokenizer, engine, batch_size=device_batch_size*2, max_problems=eval_metrics_max_problems)
             metrics["arc_easy_acc"] = run_chat_eval("ARC-Easy", model, tokenizer, engine, batch_size=device_batch_size*2, max_problems=eval_metrics_max_problems)
         metrics_str = ', '.join(f'{k}: {v:.6f}' for k, v in metrics.items())
+        last_metrics = metrics
         print0(f"Step {step:05d} | {metrics_str}")
         wandb_run.log({
             "step": step,
             **metrics,
         })
         model.train()
+
+    if master_process and last_step:
+        if last_checkpoint_step is not None and last_checkpoint_step != step:
+            delete_checkpoint_files(checkpoint_dir, last_checkpoint_step)
+        save_checkpoint(
+            checkpoint_dir,
+            step,
+            model.state_dict(),
+            None,
+            {
+                "step": step,
+                "val_loss": last_val_loss,
+                **last_metrics,
+                "model_config": dict(model.config.__dict__),
+            }
+        )
+        last_checkpoint_step = step
 
     if last_step:
         break
@@ -245,29 +298,45 @@ for step in range(num_iterations):
         "train_loss": train_loss_item,
         "num_tokens": num_tokens_item,
     })
+
+    if master_process and checkpoint_every > 0 and step > 0 and step % checkpoint_every == 0:
+        if last_checkpoint_step is not None and last_checkpoint_step != step:
+            delete_checkpoint_files(checkpoint_dir, last_checkpoint_step)
+        save_checkpoint(
+            checkpoint_dir,
+            step,
+            model.state_dict(),
+            None,
+            {
+                "step": step,
+                "val_loss": last_val_loss,
+                **last_metrics,
+                "model_config": dict(model.config.__dict__),
+            }
+        )
+        last_checkpoint_step = step
+
     step += 1
 
 # Save the model at the end of the run
 if master_process:
-    base_dir = get_base_dir()
-    depth = model.config.n_layer
-    model_tag = f"d{depth}" # base the model tag on the depth of the base model
-    checkpoint_dir = os.path.join(base_dir, "chatsft_checkpoints", model_tag)
-    model_config_kwargs = model.config.__dict__ # slightly naughty, abusing the simplicity of GPTConfig, TODO nicer
-    save_checkpoint(
-        checkpoint_dir,
-        step,
-        model.state_dict(),
-        None, # note: we don't bother to save the optimizer state
-        {
-            "step": step,
-            "val_loss": val_loss,
-            **metrics,
-            "model_config": model_config_kwargs,
-        }
-    )
-    print(f"✅ Saved model checkpoint to {checkpoint_dir}")
-
+    if last_checkpoint_step != step:
+        if last_checkpoint_step is not None and last_checkpoint_step != step:
+            delete_checkpoint_files(checkpoint_dir, last_checkpoint_step)
+        save_checkpoint(
+            checkpoint_dir,
+            step,
+            model.state_dict(),
+            None, # note: we don't bother to save the optimizer state
+            {
+                "step": step,
+                "val_loss": last_val_loss,
+                **last_metrics,
+                "model_config": dict(model.config.__dict__),
+            }
+        )
+        last_checkpoint_step = step
+    print(f"Saved model checkpoint to {checkpoint_dir}")
 # Log to report
 from nanochat.report import get_report
 get_report().log(section="Chat SFT", data=[

@@ -47,6 +47,7 @@ weight_decay = 0.0
 eval_every = 150 # -1 = disable
 eval_tokens = 20*524288
 total_batch_size = 524288
+checkpoint_every = 450
 dry_run = 0 # dry_run=1 is for experiments: we will log to wandb but we won't write checkpoints or report
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open(os.path.join('nanochat', 'configurator.py')).read()) # overrides from command line or config file
@@ -73,6 +74,7 @@ if pretrain_batch_size is not None and device_batch_size > pretrain_batch_size:
 orig_model = model
 model = torch.compile(model, dynamic=False)
 depth = model.config.n_layer
+checkpoint_subdir = f"d{depth}"
 num_flops_per_token = model.estimate_flops()
 tokens_per_fwdbwd = device_batch_size * max_seq_len # tokens per iteration for a single rank
 world_tokens_per_fwdbwd = tokens_per_fwdbwd * ddp_world_size # total tokens per iteration for all ranks
@@ -94,6 +96,34 @@ for opt in optimizers:
 
 # Midtraining data mixture and DataLoader
 base_dir = get_base_dir()
+checkpoint_dir = os.path.join(base_dir, "checkpoints", "mid_train_checkpoints", checkpoint_subdir)
+
+def delete_checkpoint_files(checkpoint_root, step_to_remove):
+    if step_to_remove is None:
+        return
+    model_path = os.path.join(checkpoint_root, f"model_{step_to_remove:06d}.pt")
+    optim_path = os.path.join(checkpoint_root, f"optim_{step_to_remove:06d}.pt")
+    meta_path = os.path.join(checkpoint_root, f"meta_{step_to_remove:06d}.json")
+    for path in (model_path, optim_path, meta_path):
+        if os.path.exists(path):
+            os.remove(path)
+
+initial_last_checkpoint_step = None
+if master_process and not dry_run and os.path.isdir(checkpoint_dir):
+    existing_steps = []
+    for filename in os.listdir(checkpoint_dir):
+        if filename.startswith("model_") and filename.endswith(".pt"):
+            try:
+                step_str = filename.split("_", 1)[1].rsplit(".", 1)[0]
+                existing_steps.append(int(step_str))
+            except (IndexError, ValueError):
+                continue
+    if existing_steps:
+        existing_steps.sort()
+        initial_last_checkpoint_step = existing_steps[-1]
+        for stale_step in existing_steps[:-1]:
+            delete_checkpoint_files(checkpoint_dir, stale_step)
+
 identity_conversations_filepath = os.path.join(base_dir, "identity_conversations.jsonl")
 train_dataset = TaskMixture([
     SmolTalk(split="train"), # 460K rows of general conversations
@@ -178,6 +208,8 @@ smooth_train_loss = 0 # EMA of training loss
 ema_beta = 0.9 # EMA decay factor
 total_training_time = 0 # total wall-clock time of training
 step = 0
+last_val_bpb = None
+last_checkpoint_step = initial_last_checkpoint_step
 while True:
     flops_so_far = num_flops_per_token * total_batch_size * step
 
@@ -194,6 +226,7 @@ while True:
         eval_steps = eval_tokens // (device_batch_size * max_seq_len * ddp_world_size)
         with autocast_ctx:
             val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
+        last_val_bpb = val_bpb
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.4f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
@@ -204,33 +237,6 @@ while True:
             "val/bpb": val_bpb,
         })
         model.train()
-
-    # save checkpoint at the end of the run (only on master process)
-    if master_process and last_step and not dry_run:
-        output_dirname = f"d{depth}" # e.g. d12
-        checkpoint_dir = os.path.join(base_dir, "mid_checkpoints", output_dirname)
-        save_checkpoint(
-            checkpoint_dir,
-            step,
-            orig_model.state_dict(),
-            [opt.state_dict() for opt in optimizers], # TODO: make sure saving across ranks is done correctly
-            {
-                "step": step,
-                "val_bpb": val_bpb, # loss at last step
-                "model_config": {
-                    "sequence_len": max_seq_len,
-                    "vocab_size": tokenizer.get_vocab_size(),
-                    "n_layer": depth,
-                    "n_head": model.config.n_head,
-                    "n_kv_head": model.config.n_kv_head,
-                    "n_embd": model.config.n_embd,
-                },
-                "user_config": user_config, # inputs to the training script
-            }
-        )
-
-    if last_step:
-        break
 
     # -------------------------------------------------------------------------
     # single training step
@@ -286,6 +292,36 @@ while True:
             "train/tok_per_sec": tok_per_sec,
             "train/mfu": mfu,
         })
+
+    if master_process and not dry_run:
+        save_due_to_interval = checkpoint_every > 0 and step > 0 and step % checkpoint_every == 0
+        save_due_to_last_step = last_step
+        if save_due_to_interval or save_due_to_last_step:
+            if last_checkpoint_step is not None and last_checkpoint_step != step:
+                delete_checkpoint_files(checkpoint_dir, last_checkpoint_step)
+            save_checkpoint(
+                checkpoint_dir,
+                step,
+                orig_model.state_dict(),
+                [opt.state_dict() for opt in optimizers], # TODO: make sure saving across ranks is done correctly
+                {
+                    "step": step,
+                    "val_bpb": last_val_bpb,
+                    "model_config": {
+                        "sequence_len": max_seq_len,
+                        "vocab_size": tokenizer.get_vocab_size(),
+                        "n_layer": depth,
+                        "n_head": model.config.n_head,
+                        "n_kv_head": model.config.n_kv_head,
+                        "n_embd": model.config.n_embd,
+                    },
+                    "user_config": user_config,
+                }
+            )
+            last_checkpoint_step = step
+
+    if last_step:
+        break
 
 # print a few more stats
 print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
