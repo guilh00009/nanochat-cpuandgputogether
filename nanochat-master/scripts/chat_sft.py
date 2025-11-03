@@ -9,6 +9,7 @@ Or torchrun for training:
 torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft
 """
 
+import json
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
@@ -94,7 +95,7 @@ def delete_checkpoint_files(checkpoint_root, step_to_remove):
             os.remove(path)
 
 initial_last_checkpoint_step = None
-if master_process and os.path.isdir(checkpoint_dir):
+if os.path.isdir(checkpoint_dir):
     existing_steps = []
     for filename in os.listdir(checkpoint_dir):
         if filename.startswith("model_") and filename.endswith(".pt"):
@@ -106,8 +107,28 @@ if master_process and os.path.isdir(checkpoint_dir):
     if existing_steps:
         existing_steps.sort()
         initial_last_checkpoint_step = existing_steps[-1]
-        for stale_step in existing_steps[:-1]:
-            delete_checkpoint_files(checkpoint_dir, stale_step)
+        if master_process:
+            for stale_step in existing_steps[:-1]:
+                delete_checkpoint_files(checkpoint_dir, stale_step)
+
+resume_meta = {}
+resume_optimizer_states = None
+if initial_last_checkpoint_step is not None and os.path.exists(os.path.join(checkpoint_dir, f"model_{initial_last_checkpoint_step:06d}.pt")):
+    model_path = os.path.join(checkpoint_dir, f"model_{initial_last_checkpoint_step:06d}.pt")
+    optim_path = os.path.join(checkpoint_dir, f"optim_{initial_last_checkpoint_step:06d}.pt")
+    meta_path = os.path.join(checkpoint_dir, f"meta_{initial_last_checkpoint_step:06d}.json")
+    try:
+        model_state = torch.load(model_path, map_location=device)
+        model.load_state_dict(model_state, strict=True)
+        if os.path.exists(optim_path):
+            resume_optimizer_states = torch.load(optim_path, map_location=device)
+        if os.path.exists(meta_path):
+            with open(meta_path, "r") as f:
+                resume_meta = json.load(f)
+        print0(f"Resuming chat SFT from checkpoint step {initial_last_checkpoint_step}")
+    except Exception as exc:
+        print0(f"Error: failed to load SFT checkpoint at step {initial_last_checkpoint_step}: {exc}")
+        raise
 
 # -----------------------------------------------------------------------------
 # Task data mixture we'll train on
@@ -188,6 +209,14 @@ for opt in optimizers:
         group["lr"] = group["lr"] * init_lr_frac
         group["initial_lr"] = group["lr"] # save the initial learning so we can decay easily later
 
+if resume_optimizer_states is not None:
+    if isinstance(resume_optimizer_states, (list, tuple)):
+        for opt, opt_state in zip(optimizers, resume_optimizer_states):
+            opt.load_state_dict(opt_state)
+    else:
+        print0("Warning: optimizer checkpoint format unrecognized; skipping optimizer state load")
+    resume_optimizer_states = None
+
 def save_chat_checkpoint(step_to_save):
     save_checkpoint(
         checkpoint_dir,
@@ -211,12 +240,18 @@ def get_lr_multiplier(it):
     return lrm
 
 # Go!
-step = 0
+start_step = (initial_last_checkpoint_step + 1) if initial_last_checkpoint_step is not None else 0
+if start_step > num_iterations:
+    start_step = num_iterations
+step = start_step
 train_iter = iter(train_loader)
-last_val_loss = None
-last_metrics = {}
+last_val_loss = resume_meta.get("val_loss") if resume_meta else None
+ignored_meta_keys = {"step", "val_loss", "model_config", "user_config"}
+last_metrics = {k: v for k, v in resume_meta.items() if k not in ignored_meta_keys} if resume_meta else {}
+val_loss = last_val_loss
+train_loss_item = float("nan")
 last_checkpoint_step = initial_last_checkpoint_step
-for step in range(num_iterations):
+for step in range(start_step, num_iterations):
     last_step = step == num_iterations - 1
 
     # evaluate the validation loss

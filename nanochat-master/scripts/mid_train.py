@@ -10,6 +10,7 @@ torchrun --standalone --nproc_per_node=8 -m scripts.mid_train -- --device_batch_
 """
 
 from collections import deque
+import json
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import time
@@ -109,7 +110,7 @@ def delete_checkpoint_files(checkpoint_root, step_to_remove):
             os.remove(path)
 
 initial_last_checkpoint_step = None
-if master_process and not dry_run and os.path.isdir(checkpoint_dir):
+if os.path.isdir(checkpoint_dir):
     existing_steps = []
     for filename in os.listdir(checkpoint_dir):
         if filename.startswith("model_") and filename.endswith(".pt"):
@@ -121,10 +122,37 @@ if master_process and not dry_run and os.path.isdir(checkpoint_dir):
     if existing_steps:
         existing_steps.sort()
         initial_last_checkpoint_step = existing_steps[-1]
-        for stale_step in existing_steps[:-1]:
-            delete_checkpoint_files(checkpoint_dir, stale_step)
+        if master_process and not dry_run:
+            for stale_step in existing_steps[:-1]:
+                delete_checkpoint_files(checkpoint_dir, stale_step)
 
 last_val_bpb = None
+
+if initial_last_checkpoint_step is not None and os.path.exists(os.path.join(checkpoint_dir, f"model_{initial_last_checkpoint_step:06d}.pt")):
+    model_path = os.path.join(checkpoint_dir, f"model_{initial_last_checkpoint_step:06d}.pt")
+    optim_path = os.path.join(checkpoint_dir, f"optim_{initial_last_checkpoint_step:06d}.pt")
+    meta_path = os.path.join(checkpoint_dir, f"meta_{initial_last_checkpoint_step:06d}.json")
+    try:
+        checkpoint_state = torch.load(model_path, map_location=device)
+        orig_model.load_state_dict(checkpoint_state, strict=True)
+        if hasattr(model, "load_state_dict"):
+            try:
+                model.load_state_dict(orig_model.state_dict(), strict=True)
+            except Exception:
+                pass
+        if os.path.exists(optim_path):
+            optimizer_states = torch.load(optim_path, map_location=device)
+            if isinstance(optimizer_states, (list, tuple)):
+                for opt, opt_state in zip(optimizers, optimizer_states):
+                    opt.load_state_dict(opt_state)
+        if os.path.exists(meta_path):
+            with open(meta_path, "r") as f:
+                resume_meta = json.load(f)
+            last_val_bpb = resume_meta.get("val_bpb", last_val_bpb)
+        print0(f"Resuming mid training from checkpoint step {initial_last_checkpoint_step}")
+    except Exception as exc:
+        print0(f"Error: failed to load checkpoint at step {initial_last_checkpoint_step}: {exc}")
+        raise
 
 def save_mid_checkpoint(step_to_save):
     save_checkpoint(
@@ -230,7 +258,7 @@ min_val_bpb = float("inf")
 smooth_train_loss = 0 # EMA of training loss
 ema_beta = 0.9 # EMA decay factor
 total_training_time = 0 # total wall-clock time of training
-step = 0
+step = initial_last_checkpoint_step if initial_last_checkpoint_step is not None else 0
 last_checkpoint_step = initial_last_checkpoint_step
 while True:
     flops_so_far = num_flops_per_token * total_batch_size * step
