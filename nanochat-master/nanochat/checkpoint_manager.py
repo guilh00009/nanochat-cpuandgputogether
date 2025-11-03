@@ -135,12 +135,20 @@ def load_model_from_dir(checkpoints_dir, device, phase, model_tag=None, step=Non
     return model, tokenizer, meta_data
 
 def load_model(source, *args, **kwargs):
-    model_dir = {
+    legacy_mapping = {
         "base": "base_checkpoints",
         "mid": "mid_checkpoints",
         "sft": "chatsft_checkpoints",
         "rl": "chatrl_checkpoints",
     }[source]
     base_dir = get_base_dir()
-    checkpoints_dir = os.path.join(base_dir, model_dir)
-    return load_model_from_dir(checkpoints_dir, *args, **kwargs)
+    candidate_dirs = []
+    if source == "mid":
+        candidate_dirs.append(os.path.join(base_dir, "checkpoints", "mid_train_checkpoints"))
+    elif source == "sft":
+        candidate_dirs.append(os.path.join(base_dir, "checkpoints", "sft_checkpoints"))
+    candidate_dirs.append(os.path.join(base_dir, legacy_mapping))
+    for checkpoints_dir in candidate_dirs:
+        if os.path.isdir(checkpoints_dir):
+            return load_model_from_dir(checkpoints_dir, *args, **kwargs)
+    raise FileNotFoundError(f"No checkpoints directory found for source '{source}'. Checked: {candidate_dirs}")
