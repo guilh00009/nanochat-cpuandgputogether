@@ -63,10 +63,10 @@ python -m scripts.tok_train --max_chars="${TOK_MAX_CHARS}"
 python -m scripts.tok_eval
 
 # ---------- 5) Probe for max model (your order, min seq_len=2048) ------------
-# device batch tries: 4 -> 3 -> 2 -> 1
-CANDIDATE_DEVICE_BATCHES=(4 3 2 1)
-# depth tries: 48, 44, 40, 36, then old sequence
-CANDIDATE_DEPTHS=(48 44 40 36 32 30 28 26 24 22 20 18 16 14 12 10 8)
+# device batch tries: force smallest batch for stability
+CANDIDATE_DEVICE_BATCHES=(1)
+# depth tries: start as high as 3× the original depth 32 and step down
+CANDIDATE_DEPTHS=(96 92 88 84 80 76 72 68 64 60 56 52 48 44 40 36 32 30 28 26 24 22 20 18 16 14 12 10 8)
 # seq_len tries: NEVER < 2048
 CANDIDATE_SEQLENS=(4096 3584 3072 2560 2048)
 
