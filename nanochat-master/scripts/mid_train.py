@@ -17,7 +17,7 @@ import time
 import wandb
 import torch
 from contextlib import nullcontext
-from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, get_base_dir, autodetect_device_type
+from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, get_base_dir, autodetect_device_type, maybe_launch_multi_gpu
 from nanochat.tokenizer import get_token_bytes
 from nanochat.checkpoint_manager import save_checkpoint
 from nanochat.loss_eval import evaluate_bpb
@@ -56,6 +56,7 @@ user_config = {k: globals()[k] for k in config_keys} # possibly useful for loggi
 # -----------------------------------------------------------------------------
 
 # Compute init
+maybe_launch_multi_gpu(device_type)
 device_type = autodetect_device_type() if device_type == "" else device_type
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
 master_process = ddp_rank == 0

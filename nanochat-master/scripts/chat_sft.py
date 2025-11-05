@@ -18,7 +18,7 @@ import torch
 import torch.distributed as dist
 from contextlib import nullcontext
 
-from nanochat.common import compute_init, compute_cleanup, get_base_dir, print0, DummyWandb, autodetect_device_type
+from nanochat.common import compute_init, compute_cleanup, get_base_dir, print0, DummyWandb, autodetect_device_type, maybe_launch_multi_gpu
 from nanochat.checkpoint_manager import load_model
 from nanochat.checkpoint_manager import save_checkpoint
 from nanochat.engine import Engine
@@ -64,6 +64,7 @@ user_config = {k: globals()[k] for k in config_keys} # possibly useful for loggi
 # -----------------------------------------------------------------------------
 
 # Compute init
+maybe_launch_multi_gpu(device_type)
 device_type = autodetect_device_type() if device_type == "" else device_type
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
 master_process = ddp_rank == 0

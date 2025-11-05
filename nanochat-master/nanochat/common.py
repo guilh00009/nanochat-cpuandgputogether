@@ -4,6 +4,8 @@ Common utilities for nanochat.
 
 import os
 import re
+import sys
+import shutil
 import logging
 import fcntl
 import urllib.request
@@ -139,6 +141,61 @@ def autodetect_device_type():
         device_type = "cpu"
     print0(f"Autodetected device type: {device_type}")
     return device_type
+
+def maybe_launch_multi_gpu(preferred_device_type=""):
+    """
+    Re-launches the current script under torchrun if multiple CUDA devices are
+    available and the current process was not already started in a distributed
+    context. This enables multi-GPU training without requiring the user to
+    manually invoke torchrun.
+    """
+    if os.environ.get("NANOCHAT_DISABLE_AUTO_DDP") == "1":
+        return
+    if os.environ.get("NANOCHAT_AUTO_DDP_LAUNCHED") == "1":
+        return
+    if is_ddp():
+        return
+    if preferred_device_type in (None, "", "auto"):
+        if torch.cuda.is_available():
+            device_type = "cuda"
+        elif torch.backends.mps.is_available():
+            device_type = "mps"
+        else:
+            device_type = "cpu"
+    else:
+        device_type = preferred_device_type
+    if device_type != "cuda":
+        return
+    if not torch.cuda.is_available():
+        return
+    num_devices = torch.cuda.device_count()
+    if num_devices <= 1:
+        print0(f"[nanochat] Detected {num_devices} CUDA device(s); staying in single-GPU mode.")
+        return
+
+    main_module = sys.modules.get("__main__")
+    spec = getattr(main_module, "__spec__", None)
+    if spec and spec.name:
+        entrypoint = ["-m", spec.name]
+    else:
+        script_path = os.path.abspath(sys.argv[0])
+        if not script_path:
+            return
+        entrypoint = [script_path]
+    additional_args = sys.argv[1:]
+
+    torchrun_exe = shutil.which("torchrun")
+    nproc_arg = f"--nproc_per_node={num_devices}"
+    if torchrun_exe:
+        cmd = [torchrun_exe, "--standalone", nproc_arg]
+    else:
+        cmd = [sys.executable, "-m", "torch.distributed.run", "--standalone", nproc_arg]
+    launch_cmd = cmd + entrypoint + additional_args
+
+    os.environ["NANOCHAT_AUTO_DDP_LAUNCHED"] = "1"
+    print0(f"[nanochat] Detected {num_devices} CUDA devices; re-launching with multi-GPU.")
+    print0(f"[nanochat] Launch command: {' '.join(launch_cmd)}")
+    os.execv(launch_cmd[0], launch_cmd)
 
 def compute_init(device_type="cuda"): # cuda|cpu|mps
     """Basic initialization that we keep doing over and over, so make common."""
