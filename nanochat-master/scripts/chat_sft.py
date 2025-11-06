@@ -84,6 +84,7 @@ depth = model.config.n_layer
 base_dir = get_base_dir()
 checkpoint_subdir = f"d{depth}"
 checkpoint_dir = os.path.join(base_dir, "checkpoints", "sft_checkpoints", checkpoint_subdir)
+script_dir = os.path.dirname(os.path.abspath(__file__))
 
 def delete_checkpoint_files(checkpoint_root, step_to_remove):
     if step_to_remove is None:
@@ -133,7 +134,7 @@ if initial_last_checkpoint_step is not None and os.path.exists(os.path.join(chec
 
 # -----------------------------------------------------------------------------
 # Task data mixture we'll train on
-identity_conversations_filepath = os.path.join(base_dir, "identity_conversations.jsonl")
+identity_conversations_filepath = os.path.join(script_dir, "identity_conversations_standardized10.jsonl")
 train_ds = TaskMixture([
     ARC(subset="ARC-Easy", split="train"), # 2.3K rows
     ARC(subset="ARC-Challenge", split="train"), # 1.1K rows
