@@ -16,6 +16,7 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import time
 import json
 from contextlib import nullcontext
+from functools import partial
 
 import wandb
 import torch
@@ -146,7 +147,7 @@ fsdp_model = None
 fsdp_state_dict_config = None
 if use_fsdp:
     print0("[FSDP] Wrapping model with Fully Sharded Data Parallel.")
-    auto_wrap_policy = size_based_auto_wrap_policy(min_num_params=1_000_000)
+    auto_wrap_policy = partial(size_based_auto_wrap_policy, min_num_params=1_000_000)
     fsdp_state_dict_config = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
     def _fsdp_param_init_fn(module):
         if hasattr(module, "init_weights"):
