@@ -30,6 +30,53 @@ fi
 
 source .venv/bin/activate
 
+USE_MULTI_GPU=${USE_MULTI_GPU:-1}
+NANOCHAT_NPROC=${NANOCHAT_NPROC:-}
+
+detect_nproc() {
+  local requested="${NANOCHAT_NPROC}"
+  if [ -n "${requested}" ]; then
+    echo "${requested}"
+    return
+  fi
+
+  if ! [[ "${USE_MULTI_GPU}" =~ ^(1|true|TRUE|yes|YES)$ ]]; then
+    echo 1
+    return
+  fi
+
+  local count=0
+  if [ "${HAVE_NVIDIA}" -eq 1 ]; then
+    count=$(nvidia-smi -L | grep -c '^GPU ' || true)
+  fi
+
+  if [ "${count}" -lt 1 ] && command -v python >/dev/null 2>&1; then
+    count=$(python - <<'PY'
+import torch
+try:
+    print(torch.cuda.device_count())
+except Exception:
+    print(0)
+PY
+)
+    count=$(echo "${count}" | tr -d '[:space:]')
+  fi
+
+  if ! [[ "${count}" =~ ^[0-9]+$ ]]; then
+    count=0
+  fi
+
+  if [ "${count}" -lt 1 ]; then
+    count=1
+  fi
+
+  echo "${count}"
+}
+
+NPROC_PER_NODE=$(detect_nproc)
+TORCHRUN=(torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}")
+echo "Using torchrun with ${NPROC_PER_NODE} process(es). Set USE_MULTI_GPU=0 or NANOCHAT_NPROC to override."
+
 : "${WANDB_RUN:=big40}"
 python -m nanochat.report reset
 
@@ -78,7 +125,7 @@ try_probe () {
   local db="$1"
   local depth="$2"
   local seqlen="$3"
-  torchrun --standalone --nproc_per_node=1 -m scripts.base_train \
+  "${TORCHRUN[@]}" -m scripts.base_train \
     --depth="${depth}" \
     --max_seq_len="${seqlen}" \
     --device_batch_size="${db}" \
@@ -138,7 +185,7 @@ echo "BASE_ITERS:     ${BASE_ITERS}"
 echo "====================================================="
 
 # ---------- 7) Base training --------------------------------------------------
-torchrun --standalone --nproc_per_node=1 -m scripts.base_train \
+"${TORCHRUN[@]}" -m scripts.base_train \
   --depth="${BEST_DEPTH}" \
   --max_seq_len="${BEST_SEQLEN}" \
   --device_batch_size="${BEST_DBSZ}" \
@@ -151,8 +198,8 @@ torchrun --standalone --nproc_per_node=1 -m scripts.base_train \
   --num_iterations="${BASE_ITERS}"
 
 # ---------- 8) base_loss / base_eval -----------------------------------------
-torchrun --standalone --nproc_per_node=1 -m scripts.base_loss -- --device_batch_size="${BEST_DBSZ}" --split_tokens="${EVAL_TOKENS}"
-torchrun --standalone --nproc_per_node=1 -m scripts.base_eval -- --max-per-task=32
+"${TORCHRUN[@]}" -m scripts.base_loss -- --device_batch_size="${BEST_DBSZ}" --split_tokens="${EVAL_TOKENS}"
+"${TORCHRUN[@]}" -m scripts.base_eval -- --max-per-task=32
 
 # ======================================================================
 # FROM HERE ON: repo-native mid/SFT (your working style)
@@ -160,19 +207,19 @@ torchrun --standalone --nproc_per_node=1 -m scripts.base_eval -- --max-per-task=
 
 # 9) MID-TRAIN
 echo "==> mid-train (repo-native args only)"
-torchrun --standalone --nproc_per_node=1 -m scripts.mid_train -- --device_batch_size=${BEST_DBSZ}
+"${TORCHRUN[@]}" -m scripts.mid_train -- --device_batch_size=${BEST_DBSZ}
 
 # 10) EVAL (mid)
 echo "==> eval (mid)"
-torchrun --standalone --nproc_per_node=1 -m scripts.chat_eval -- -i mid
+"${TORCHRUN[@]}" -m scripts.chat_eval -- -i mid
 
 # 11) SFT
 echo "==> sft (same device_batch_size)"
-torchrun --standalone --nproc_per_node=1 -m scripts.chat_sft -- --device_batch_size=${BEST_DBSZ}
+"${TORCHRUN[@]}" -m scripts.chat_sft -- --device_batch_size=${BEST_DBSZ}
 
 # 12) EVAL (sft)
 echo "==> eval (sft)"
-torchrun --standalone --nproc_per_node=1 -m scripts.chat_eval -- -i sft
+"${TORCHRUN[@]}" -m scripts.chat_eval -- -i sft
 
 # 13) report
 echo "==> report"
