@@ -338,7 +338,12 @@ for step in range(start_step, num_iterations + 1):
         model.eval()
         orig_model.eval()
         val_loader = build_val_loader()
-        eval_steps = eval_tokens // (device_batch_size * max_seq_len * ddp_world_size)
+        tokens_per_eval_step = max(1, device_batch_size * max_seq_len * ddp_world_size)
+        eval_steps = eval_tokens // tokens_per_eval_step
+        if eval_steps == 0:
+            eval_steps = 1
+            if master_process:
+                print0("Warning: eval_tokens smaller than one micro-batch; evaluating on a single step instead.")
         if use_fsdp:
             with FSDP.summon_full_params(model):
                 with autocast_ctx:
