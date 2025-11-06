@@ -150,6 +150,8 @@ if use_fsdp:
     auto_wrap_policy = partial(size_based_auto_wrap_policy, min_num_params=1_000_000)
     fsdp_state_dict_config = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
     def _fsdp_param_init_fn(module):
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        module.to_empty(device=device)
         if hasattr(module, "init_weights"):
             module.init_weights()
     fsdp_model = FSDP(
