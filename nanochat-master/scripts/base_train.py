@@ -19,6 +19,12 @@ from contextlib import nullcontext
 
 import wandb
 import torch
+from torch.distributed.fsdp import (
+    FullyShardedDataParallel as FSDP,
+    StateDictType,
+    FullStateDictConfig,
+)
+from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
 
 from nanochat.gpt import GPT, GPTConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader
@@ -53,6 +59,7 @@ grad_clip = 1.0 # gradient clipping value (0.0 = disabled)
 warmup_ratio = 0.0 # ratio of iterations for LR warmup
 warmdown_ratio = 0.2 # ratio of iterations for LR warmdown
 final_lr_frac = 0.0 # final LR is this fraction of the initial LR
+use_fsdp = True # enable Fully Sharded Data Parallel when possible
 # Evaluation
 eval_every = 250 # every how many steps to evaluate the model for val bpb
 eval_tokens = 20*524288 # number of tokens to evaluate val loss on
@@ -76,6 +83,8 @@ master_process = ddp_rank == 0 # this process will do logging, checkpointing etc
 autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type == "cuda" else nullcontext()
 synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
 get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
+use_fsdp = use_fsdp and device_type == "cuda" and ddp and ddp_world_size > 1
+user_config["use_fsdp"] = use_fsdp
 
 # wandb logging init
 use_dummy_wandb = run == "dummy" or not master_process
@@ -118,15 +127,33 @@ print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {
 model_config_kwargs = dict(sequence_len=max_seq_len, vocab_size=vocab_size, n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim)
 with torch.device("meta"):
     model_config = GPTConfig(**model_config_kwargs)
-    model = GPT(model_config)
-model.to_empty(device=device)
-model.init_weights()
-orig_model = model # original, uncompiled model, for saving raw model state_dict
-model = torch.compile(model, dynamic=False) # TODO: dynamic True/False think through
-num_params = sum(p.numel() for p in model.parameters())
+    raw_model = GPT(model_config)
+raw_model.to_empty(device=device)
+raw_model.init_weights()
+num_params = sum(p.numel() for p in raw_model.parameters())
 print0(f"Number of parameters: {num_params:,}")
-num_flops_per_token = model.estimate_flops()
+num_flops_per_token = raw_model.estimate_flops()
 print0(f"Estimated FLOPs per token: {num_flops_per_token:e}")
+
+fsdp_model = None
+fsdp_state_dict_config = None
+if use_fsdp:
+    print0("[FSDP] Wrapping model with Fully Sharded Data Parallel.")
+    auto_wrap_policy = size_based_auto_wrap_policy(min_num_params=1_000_000)
+    fsdp_state_dict_config = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+    fsdp_model = FSDP(
+        raw_model,
+        auto_wrap_policy=auto_wrap_policy,
+        device_id=ddp_local_rank,
+        sync_module_states=True,
+        use_orig_params=True,
+    )
+    FSDP.set_state_dict_type(fsdp_model, StateDictType.FULL_STATE_DICT, fsdp_state_dict_config)
+    model = fsdp_model
+    orig_model = raw_model
+else:
+    orig_model = raw_model # original, uncompiled model, for saving raw model state_dict
+    model = torch.compile(raw_model, dynamic=False) # TODO: dynamic True/False think through
 
 # Calculate number of iterations. Either it is given, or from target flops, or from target data:param ratio (in that order)
 assert num_iterations > 0 or target_param_data_ratio > 0 or target_flops > 0
@@ -150,7 +177,13 @@ print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
 
 # -----------------------------------------------------------------------------
 # Initialize the Optimizer (Muon for Linear layers, AdamW for embedding and lm_head)
-optimizers = model.setup_optimizers(unembedding_lr=unembedding_lr, embedding_lr=embedding_lr, matrix_lr=matrix_lr, weight_decay=weight_decay)
+optimizers = orig_model.setup_optimizers(
+    unembedding_lr=unembedding_lr,
+    embedding_lr=embedding_lr,
+    matrix_lr=matrix_lr,
+    weight_decay=weight_decay,
+    use_dist_optimizers=not use_fsdp,
+)
 adamw_optimizer, muon_optimizer = optimizers
 
 # Initialize the DataLoaders for train/val
@@ -196,12 +229,16 @@ if initial_last_checkpoint_step is not None and os.path.exists(os.path.join(chec
     meta_path = os.path.join(checkpoint_dir, f"meta_{initial_last_checkpoint_step:06d}.json")
     try:
         checkpoint_state = torch.load(model_path, map_location=device)
-        orig_model.load_state_dict(checkpoint_state, strict=True)
-        if hasattr(model, "load_state_dict"):
-            try:
-                model.load_state_dict(orig_model.state_dict(), strict=True)
-            except Exception:
-                pass
+        if use_fsdp:
+            with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, fsdp_state_dict_config):
+                model.load_state_dict(checkpoint_state, strict=True)
+        else:
+            orig_model.load_state_dict(checkpoint_state, strict=True)
+            if hasattr(model, "load_state_dict"):
+                try:
+                    model.load_state_dict(orig_model.state_dict(), strict=True)
+                except Exception:
+                    pass
         if os.path.exists(optim_path):
             optimizer_states = torch.load(optim_path, map_location=device)
             if isinstance(optimizer_states, (list, tuple)):
@@ -262,10 +299,15 @@ def save_base_checkpoint(step_to_save):
         "device_batch_size": device_batch_size,
         "max_seq_len": max_seq_len,
     }
+    if use_fsdp:
+        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, fsdp_state_dict_config):
+            model_state = model.state_dict()
+    else:
+        model_state = orig_model.state_dict()
     save_checkpoint(
         checkpoint_dir,
         step_to_save,
-        orig_model.state_dict(),
+        model_state,
         [opt.state_dict() for opt in optimizers], # TODO: make sure saving across ranks is done correctly
         meta,
     )
@@ -278,10 +320,16 @@ for step in range(start_step, num_iterations + 1):
     # once in a while: evaluate the val bpb (all ranks participate)
     if last_step or (eval_every > 0 and step % eval_every == 0):
         model.eval()
+        orig_model.eval()
         val_loader = build_val_loader()
         eval_steps = eval_tokens // (device_batch_size * max_seq_len * ddp_world_size)
-        with autocast_ctx:
-            val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
+        if use_fsdp:
+            with FSDP.summon_full_params(model, recursive=True):
+                with autocast_ctx:
+                    val_bpb = evaluate_bpb(orig_model, val_loader, eval_steps, token_bytes)
+        else:
+            with autocast_ctx:
+                val_bpb = evaluate_bpb(orig_model, val_loader, eval_steps, token_bytes)
         print0(f"Step {step:05d} | Validation bpb: {val_bpb:.4f}")
         if val_bpb < min_val_bpb:
             min_val_bpb = val_bpb
@@ -292,14 +340,21 @@ for step in range(start_step, num_iterations + 1):
             "val/bpb": val_bpb,
         })
         model.train()
+        orig_model.train()
 
     # once in a while: estimate the CORE metric (all ranks participate)
     # use the original uncompiled model because the inputs keep changing shape
     results = {}
     if core_metric_every > 0 and (last_step or (step > 0 and step % core_metric_every == 0)):
         model.eval()
-        with autocast_ctx:
-            results = evaluate_model(orig_model, tokenizer, device, max_per_task=core_metric_max_per_task)
+        orig_model.eval()
+        if use_fsdp:
+            with FSDP.summon_full_params(model, recursive=True):
+                with autocast_ctx:
+                    results = evaluate_model(orig_model, tokenizer, device, max_per_task=core_metric_max_per_task)
+        else:
+            with autocast_ctx:
+                results = evaluate_model(orig_model, tokenizer, device, max_per_task=core_metric_max_per_task)
         print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
         wandb_run.log({
             "step": step,
@@ -308,11 +363,13 @@ for step in range(start_step, num_iterations + 1):
             "centered_results": results["centered_results"],
         })
         model.train()
+        orig_model.train()
 
     # once in a while: sample from the model (only on master process)
     # use the original uncompiled model because the inputs keep changing shape
     if master_process and (last_step or (step > 0 and step % sample_every == 0)):
         model.eval()
+        orig_model.eval()
         prompts = [
             "The capital of France is",
             "The chemical symbol of gold is",
@@ -322,13 +379,23 @@ for step in range(start_step, num_iterations + 1):
             "My favorite color is",
             "If 5*x + 3 = 13, then x is",
         ]
-        engine = Engine(orig_model, tokenizer) # use orig_model to avoid recompilation
-        for prompt in prompts:
-            tokens = tokenizer(prompt, prepend="<|bos|>")
-            with autocast_ctx:
-                sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
-            print0(tokenizer.decode(sample[0]))
+        if use_fsdp:
+            with FSDP.summon_full_params(model, recursive=True):
+                engine = Engine(orig_model, tokenizer) # use orig_model to avoid recompilation
+                for prompt in prompts:
+                    tokens = tokenizer(prompt, prepend="<|bos|>")
+                    with autocast_ctx:
+                        sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
+                    print0(tokenizer.decode(sample[0]))
+        else:
+            engine = Engine(orig_model, tokenizer) # use orig_model to avoid recompilation
+            for prompt in prompts:
+                tokens = tokenizer(prompt, prepend="<|bos|>")
+                with autocast_ctx:
+                    sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
+                print0(tokenizer.decode(sample[0]))
         model.train()
+        orig_model.train()
 
     if last_step:
         if master_process:
@@ -352,7 +419,10 @@ for step in range(start_step, num_iterations + 1):
         x, y = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
     # gradient clipping (TODO possibly expertiment with)
     if grad_clip > 0.0:
-        torch.nn.utils.clip_grad_norm_(orig_model.parameters(), grad_clip)
+        if use_fsdp:
+            model.clip_grad_norm_(grad_clip)
+        else:
+            torch.nn.utils.clip_grad_norm_(orig_model.parameters(), grad_clip)
     # step the optimizers
     lrm = get_lr_multiplier(step)
     for opt in optimizers:
