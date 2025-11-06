@@ -160,8 +160,6 @@ if use_fsdp:
         device_id=ddp_local_rank,
         sync_module_states=True,
         param_init_fn=_fsdp_param_init_fn,
-        flatten_parameters=False,
-        limit_all_gathers=True,
         use_orig_params=True,
     )
     FSDP.set_state_dict_type(fsdp_model, StateDictType.FULL_STATE_DICT, fsdp_state_dict_config)
