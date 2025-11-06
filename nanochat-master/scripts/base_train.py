@@ -340,7 +340,7 @@ for step in range(start_step, num_iterations + 1):
         val_loader = build_val_loader()
         eval_steps = eval_tokens // (device_batch_size * max_seq_len * ddp_world_size)
         if use_fsdp:
-            with FSDP.summon_full_params(model, recursive=True):
+            with FSDP.summon_full_params(model):
                 with autocast_ctx:
                     val_bpb = evaluate_bpb(orig_model, val_loader, eval_steps, token_bytes)
         else:
@@ -365,7 +365,7 @@ for step in range(start_step, num_iterations + 1):
         model.eval()
         orig_model.eval()
         if use_fsdp:
-            with FSDP.summon_full_params(model, recursive=True):
+            with FSDP.summon_full_params(model):
                 with autocast_ctx:
                     results = evaluate_model(orig_model, tokenizer, device, max_per_task=core_metric_max_per_task)
         else:
@@ -396,7 +396,7 @@ for step in range(start_step, num_iterations + 1):
             "If 5*x + 3 = 13, then x is",
         ]
         if use_fsdp:
-            with FSDP.summon_full_params(model, recursive=True):
+            with FSDP.summon_full_params(model):
                 engine = Engine(orig_model, tokenizer) # use orig_model to avoid recompilation
                 for prompt in prompts:
                     tokens = tokenizer(prompt, prepend="<|bos|>")
