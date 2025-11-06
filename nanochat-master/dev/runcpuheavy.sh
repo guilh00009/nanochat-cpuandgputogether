@@ -109,65 +109,15 @@ python -m nanochat.dataset -n "${ALL_SHARDS}" &
 python -m scripts.tok_train --max_chars="${TOK_MAX_CHARS}"
 python -m scripts.tok_eval
 
-# ---------- 5) Probe for max model (your order, min seq_len=2048) ------------
-# device batch tries: force smallest batch for stability
-CANDIDATE_DEVICE_BATCHES=(1)
-# depth tries: start as high as 3× the original depth 32 and step down
-CANDIDATE_DEPTHS=(96 92 88 84 80 76 72 68 64 60 56 52 48 44 40 36 32 30 28 26 24 22 20 18 16 14 12 10 8)
-# seq_len tries: NEVER < 2048
-CANDIDATE_SEQLENS=(4096 3584 3072 2560 2048)
-
-BEST_DBSZ=""
-BEST_DEPTH=""
-BEST_SEQLEN=""
-
-try_probe () {
-  local db="$1"
-  local depth="$2"
-  local seqlen="$3"
-  "${TORCHRUN[@]}" -m scripts.base_train \
-    --depth="${depth}" \
-    --max_seq_len="${seqlen}" \
-    --device_batch_size="${db}" \
-    --total_batch_size=32768 \
-    --num_iterations=2 \
-    --eval_every=999999 \
-    --sample_every=999999 \
-    --core_metric_every=999999 \
-    --eval_tokens=2048 \
-    >/dev/null 2>&1
-}
-
-echo "=== Probing maximum depth/seq-len/dbsz that fit memory (40GB) ==="
+# ---------- 5) Fixed training configuration ----------------------------------
 if [ "${HAVE_NVIDIA}" -ne 1 ]; then
   echo "No NVIDIA GPU detected; this script expects a 40GB GPU. Exiting."
   exit 1
 fi
 
-for db in "${CANDIDATE_DEVICE_BATCHES[@]}"; do
-  for depth in "${CANDIDATE_DEPTHS[@]}"; do
-    for seqlen in "${CANDIDATE_SEQLENS[@]}"; do
-      echo "Probe dbsz=${db} depth=${depth} seq_len=${seqlen} ..."
-      if try_probe "${db}" "${depth}" "${seqlen}"; then
-        BEST_DBSZ="${db}"
-        BEST_DEPTH="${depth}"
-        BEST_SEQLEN="${seqlen}"
-        echo "  -> OK"
-        break 2
-      else
-        echo "  -> OOM / fail"
-      fi
-    done
-  done
-  [ -n "${BEST_DEPTH}" ] && break
-done
-
-# If we STILL don't have a model here, it means even depth=8 at seq_len=2048 didn't fit.
-if [ -z "${BEST_DEPTH}" ]; then
-  echo "FATAL: could not fit even depth=8 at seq_len=2048 on this GPU."
-  echo "You asked to never go below 2048, so we won't auto-lower it."
-  exit 1
-fi
+BEST_DBSZ="${DEVICE_BATCH_SIZE_OVERRIDE:-1}"
+BEST_DEPTH="${DEPTH_OVERRIDE:-92}"
+BEST_SEQLEN="${SEQ_LEN_OVERRIDE:-2048}"
 
 # ---------- 6) Global knobs for 40GB -----------------------------------------
 BASE_TOTAL_BATCH=262144     # 256k tokens
