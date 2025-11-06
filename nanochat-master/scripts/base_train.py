@@ -137,8 +137,6 @@ model_config_kwargs = dict(
 with torch.device("meta"):
     model_config = GPTConfig(**model_config_kwargs)
     raw_model = GPT(model_config)
-raw_model.to_empty(device=device)
-raw_model.init_weights()
 num_params = sum(p.numel() for p in raw_model.parameters())
 print0(f"Number of parameters: {num_params:,}")
 num_flops_per_token = raw_model.estimate_flops()
@@ -150,17 +148,23 @@ if use_fsdp:
     print0("[FSDP] Wrapping model with Fully Sharded Data Parallel.")
     auto_wrap_policy = size_based_auto_wrap_policy(min_num_params=1_000_000)
     fsdp_state_dict_config = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+    def _fsdp_param_init_fn(module):
+        if hasattr(module, "init_weights"):
+            module.init_weights()
     fsdp_model = FSDP(
         raw_model,
         auto_wrap_policy=auto_wrap_policy,
         device_id=ddp_local_rank,
         sync_module_states=True,
+        param_init_fn=_fsdp_param_init_fn,
         use_orig_params=True,
     )
     FSDP.set_state_dict_type(fsdp_model, StateDictType.FULL_STATE_DICT, fsdp_state_dict_config)
     model = fsdp_model
     orig_model = raw_model
 else:
+    raw_model.to_empty(device=device)
+    raw_model.init_weights()
     orig_model = raw_model # original, uncompiled model, for saving raw model state_dict
     model = torch.compile(raw_model, dynamic=False) # TODO: dynamic True/False think through
 
