@@ -14,6 +14,7 @@ python -m scripts.base_train --depth=4 --max_seq_len=512 --device_batch_size=1 -
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import time
+import json
 from contextlib import nullcontext
 
 import wandb
@@ -58,6 +59,7 @@ eval_tokens = 20*524288 # number of tokens to evaluate val loss on
 core_metric_every = 2000 # every how many steps to evaluate the core metric (-1 = disable)
 core_metric_max_per_task = 500 # examples per task in estimating the core metric
 sample_every = 2000 # every how many steps to sample from the model
+checkpoint_every = 50 # every how many steps to write a checkpoint (<=0 = disable)
 # Output
 model_tag = "" # optionally override the model tag for the output checkpoint directory name
 # now allow CLI to override the settings via the configurator lol
@@ -150,6 +152,61 @@ tokens_dir = os.path.join(base_dir, "tokenized_data")
 train_loader = tokenizing_distributed_data_loader(device_batch_size, max_seq_len, split="train", device=device)
 build_val_loader = lambda: tokenizing_distributed_data_loader(device_batch_size, max_seq_len, split="val", device=device)
 x, y = next(train_loader) # kick off load of the very first batch of data
+output_dirname = model_tag if model_tag else f"d{depth}" # e.g. d12
+checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
+
+def delete_checkpoint_files(checkpoint_root, step_to_remove):
+    if step_to_remove is None:
+        return
+    model_path = os.path.join(checkpoint_root, f"model_{step_to_remove:06d}.pt")
+    optim_path = os.path.join(checkpoint_root, f"optim_{step_to_remove:06d}.pt")
+    meta_path = os.path.join(checkpoint_root, f"meta_{step_to_remove:06d}.json")
+    for path in (model_path, optim_path, meta_path):
+        if os.path.exists(path):
+            os.remove(path)
+
+initial_last_checkpoint_step = None
+if os.path.isdir(checkpoint_dir):
+    existing_steps = []
+    for filename in os.listdir(checkpoint_dir):
+        if filename.startswith("model_") and filename.endswith(".pt"):
+            try:
+                step_str = filename.split("_", 1)[1].rsplit(".", 1)[0]
+                existing_steps.append(int(step_str))
+            except (IndexError, ValueError):
+                continue
+    if existing_steps:
+        existing_steps.sort()
+        initial_last_checkpoint_step = existing_steps[-1]
+        if master_process:
+            for stale_step in existing_steps[:-1]:
+                delete_checkpoint_files(checkpoint_dir, stale_step)
+
+resume_meta = {}
+if initial_last_checkpoint_step is not None and os.path.exists(os.path.join(checkpoint_dir, f"model_{initial_last_checkpoint_step:06d}.pt")):
+    model_path = os.path.join(checkpoint_dir, f"model_{initial_last_checkpoint_step:06d}.pt")
+    optim_path = os.path.join(checkpoint_dir, f"optim_{initial_last_checkpoint_step:06d}.pt")
+    meta_path = os.path.join(checkpoint_dir, f"meta_{initial_last_checkpoint_step:06d}.json")
+    try:
+        checkpoint_state = torch.load(model_path, map_location=device)
+        orig_model.load_state_dict(checkpoint_state, strict=True)
+        if hasattr(model, "load_state_dict"):
+            try:
+                model.load_state_dict(orig_model.state_dict(), strict=True)
+            except Exception:
+                pass
+        if os.path.exists(optim_path):
+            optimizer_states = torch.load(optim_path, map_location=device)
+            if isinstance(optimizer_states, (list, tuple)):
+                for opt, opt_state in zip(optimizers, optimizer_states):
+                    opt.load_state_dict(opt_state)
+        if os.path.exists(meta_path):
+            with open(meta_path, "r") as f:
+                resume_meta = json.load(f)
+        print0(f"Resuming base training from checkpoint step {initial_last_checkpoint_step}")
+    except Exception as exc:
+        print0(f"Error: failed to load checkpoint at step {initial_last_checkpoint_step}: {exc}")
+        raise
 
 # -----------------------------------------------------------------------------
 # Set up hyperparameter schedulers
@@ -174,17 +231,45 @@ def get_muon_momentum(it):
 
 # -----------------------------------------------------------------------------
 # Training loop
-min_val_bpb = float("inf")
-smooth_train_loss = 0 # EMA of training loss
+val_bpb = resume_meta.get("val_bpb") if resume_meta else None
+min_val_bpb = resume_meta.get("min_val_bpb", float("inf"))
+if min_val_bpb is None:
+    min_val_bpb = float("inf")
+smooth_train_loss = resume_meta.get("smooth_train_loss", 0) # EMA of training loss
 ema_beta = 0.9 # EMA decay factor
-total_training_time = 0 # total wall-clock time of training
+total_training_time = resume_meta.get("total_training_time", 0) # total wall-clock time of training
+last_checkpoint_step = initial_last_checkpoint_step
+start_step = (initial_last_checkpoint_step + 1) if initial_last_checkpoint_step is not None else 0
+if start_step > num_iterations:
+    start_step = num_iterations
+
+def save_base_checkpoint(step_to_save):
+    meta = {
+        "step": step_to_save,
+        "val_bpb": val_bpb,
+        "min_val_bpb": None if min_val_bpb == float("inf") else min_val_bpb,
+        "total_training_time": total_training_time,
+        "smooth_train_loss": smooth_train_loss,
+        "model_config": model_config_kwargs,
+        "user_config": user_config,
+        "device_batch_size": device_batch_size,
+        "max_seq_len": max_seq_len,
+    }
+    save_checkpoint(
+        checkpoint_dir,
+        step_to_save,
+        orig_model.state_dict(),
+        [opt.state_dict() for opt in optimizers], # TODO: make sure saving across ranks is done correctly
+        meta,
+    )
+
 # note that we run +1 steps only so that we can eval and save at the end
-for step in range(num_iterations + 1):
+for step in range(start_step, num_iterations + 1):
     last_step = step == num_iterations
     flops_so_far = num_flops_per_token * total_batch_size * step
 
     # once in a while: evaluate the val bpb (all ranks participate)
-    if last_step or step % eval_every == 0:
+    if last_step or (eval_every > 0 and step % eval_every == 0):
         model.eval()
         val_loader = build_val_loader()
         eval_steps = eval_tokens // (device_batch_size * max_seq_len * ddp_world_size)
@@ -238,26 +323,12 @@ for step in range(num_iterations + 1):
             print0(tokenizer.decode(sample[0]))
         model.train()
 
-    # save checkpoint at the end of the run (only on master process)
-    if master_process and last_step:
-        output_dirname = model_tag if model_tag else f"d{depth}" # e.g. d12
-        checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
-        save_checkpoint(
-            checkpoint_dir,
-            step,
-            orig_model.state_dict(),
-            [opt.state_dict() for opt in optimizers], # TODO: make sure saving across ranks is done correctly
-            {
-                "step": step,
-                "val_bpb": val_bpb, # loss at last step
-                "model_config": model_config_kwargs,
-                "user_config": user_config, # inputs to the training script
-                "device_batch_size": device_batch_size,
-                "max_seq_len": max_seq_len,
-            }
-        )
-
     if last_step:
+        if master_process:
+            if last_checkpoint_step is not None and last_checkpoint_step != step:
+                delete_checkpoint_files(checkpoint_dir, last_checkpoint_step)
+            save_base_checkpoint(step)
+            last_checkpoint_step = step
         break
 
     # -------------------------------------------------------------------------
@@ -313,6 +384,12 @@ for step in range(num_iterations + 1):
             "train/tok_per_sec": tok_per_sec,
             "train/mfu": mfu,
         })
+
+    if master_process and checkpoint_every > 0 and step > 0 and step % checkpoint_every == 0:
+        if last_checkpoint_step is not None and last_checkpoint_step != step:
+            delete_checkpoint_files(checkpoint_dir, last_checkpoint_step)
+        save_base_checkpoint(step)
+        last_checkpoint_step = step
 
 # print a few more stats
 print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
