@@ -18,6 +18,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as activation_checkpoint_fn
 
 from nanochat.common import get_dist_info, print0
 from nanochat.muon import Muon, DistMuon
@@ -31,6 +32,7 @@ class GPTConfig:
     n_head: int = 6 # number of query heads
     n_kv_head: int = 6 # number of key/value heads (MQA)
     n_embd: int = 768
+    activation_checkpoint: bool = False
 
 
 def norm(x):
@@ -263,8 +265,18 @@ class GPT(nn.Module):
         # Forward the trunk of the Transformer
         x = self.transformer.wte(idx)
         x = norm(x)
+        cos, sin = cos_sin
         for block in self.transformer.h:
-            x = block(x, cos_sin, kv_cache)
+            if (
+                self.config.activation_checkpoint
+                and self.training
+                and kv_cache is None
+            ):
+                def block_forward(x_in, cos_in, sin_in, *, blk=block):
+                    return blk(x_in, (cos_in, sin_in), None)
+                x = activation_checkpoint_fn(block_forward, x, cos, sin)
+            else:
+                x = block(x, (cos, sin), kv_cache)
         x = norm(x)
 
         # Forward the lm_head (compute logits)
