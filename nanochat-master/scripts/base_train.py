@@ -138,6 +138,7 @@ model_config_kwargs = dict(
 with torch.device("meta"):
     model_config = GPTConfig(**model_config_kwargs)
     raw_model = GPT(model_config)
+    raw_model.to(dtype=torch.bfloat16)
 num_params = sum(p.numel() for p in raw_model.parameters())
 print0(f"Number of parameters: {num_params:,}")
 num_flops_per_token = raw_model.estimate_flops()
@@ -148,7 +149,7 @@ fsdp_state_dict_config = None
 if use_fsdp:
     print0("[FSDP] Wrapping model with Fully Sharded Data Parallel.")
     auto_wrap_policy = partial(size_based_auto_wrap_policy, min_num_params=1_000_000)
-    fsdp_state_dict_config = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+    fsdp_state_dict_config = FullStateDictConfig(offload_to_cpu=False, rank0_only=True)
     def _fsdp_param_init_fn(module):
         device = torch.device(f"cuda:{torch.cuda.current_device()}")
         module.to_empty(device=device)
