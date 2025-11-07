@@ -338,7 +338,8 @@ for step in range(start_step, num_iterations + 1):
     flops_so_far = num_flops_per_token * total_batch_size * step
 
     # once in a while: evaluate the val bpb (all ranks participate)
-    if last_step or (eval_every > 0 and step % eval_every == 0):
+    should_eval = eval_every > 0 and (last_step or (step > 0 and step % eval_every == 0))
+    if should_eval:
         model.eval()
         orig_model.eval()
         val_loader = build_val_loader()
