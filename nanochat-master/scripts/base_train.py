@@ -316,16 +316,19 @@ def save_base_checkpoint(step_to_save):
         "device_batch_size": device_batch_size,
         "max_seq_len": max_seq_len,
     }
+    # All ranks must participate in the state dict gathering when using FSDP.
     if use_fsdp:
         with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, fsdp_state_dict_config):
             model_state = model.state_dict()
     else:
         model_state = orig_model.state_dict()
+    if not master_process:
+        return
     save_checkpoint(
         checkpoint_dir,
         step_to_save,
         model_state,
-        [opt.state_dict() for opt in optimizers], # TODO: make sure saving across ranks is done correctly
+        [opt.state_dict() for opt in optimizers],
         meta,
     )
 
@@ -387,9 +390,10 @@ for step in range(start_step, num_iterations + 1):
         model.train()
         orig_model.train()
 
-    # once in a while: sample from the model (only on master process)
+    # once in a while: sample from the model (only log from master but all ranks must participate in FSDP gathers)
     # use the original uncompiled model because the inputs keep changing shape
-    if master_process and (last_step or (step > 0 and step % sample_every == 0)):
+    should_sample = last_step or (step > 0 and step % sample_every == 0)
+    if should_sample:
         model.eval()
         orig_model.eval()
         prompts = [
@@ -401,29 +405,30 @@ for step in range(start_step, num_iterations + 1):
             "My favorite color is",
             "If 5*x + 3 = 13, then x is",
         ]
-        if use_fsdp:
-            with FSDP.summon_full_params(model):
-                engine = Engine(orig_model, tokenizer) # use orig_model to avoid recompilation
-                for prompt in prompts:
-                    tokens = tokenizer(prompt, prepend="<|bos|>")
-                    with autocast_ctx:
-                        sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
-                    print0(tokenizer.decode(sample[0]))
-        else:
+
+        def run_sampling():
+            if not master_process:
+                return
             engine = Engine(orig_model, tokenizer) # use orig_model to avoid recompilation
             for prompt in prompts:
                 tokens = tokenizer(prompt, prepend="<|bos|>")
                 with autocast_ctx:
                     sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
                 print0(tokenizer.decode(sample[0]))
+
+        if use_fsdp:
+            with FSDP.summon_full_params(model):
+                run_sampling()
+        else:
+            run_sampling()
         model.train()
         orig_model.train()
 
     if last_step:
+        if master_process and last_checkpoint_step is not None and last_checkpoint_step != step:
+            delete_checkpoint_files(checkpoint_dir, last_checkpoint_step)
+        save_base_checkpoint(step)
         if master_process:
-            if last_checkpoint_step is not None and last_checkpoint_step != step:
-                delete_checkpoint_files(checkpoint_dir, last_checkpoint_step)
-            save_base_checkpoint(step)
             last_checkpoint_step = step
         break
 
@@ -484,11 +489,12 @@ for step in range(start_step, num_iterations + 1):
             "train/mfu": mfu,
         })
 
-    if master_process and checkpoint_every > 0 and step > 0 and step % checkpoint_every == 0:
-        if last_checkpoint_step is not None and last_checkpoint_step != step:
+    if checkpoint_every > 0 and step > 0 and step % checkpoint_every == 0:
+        if master_process and last_checkpoint_step is not None and last_checkpoint_step != step:
             delete_checkpoint_files(checkpoint_dir, last_checkpoint_step)
         save_base_checkpoint(step)
-        last_checkpoint_step = step
+        if master_process:
+            last_checkpoint_step = step
 
 # print a few more stats
 print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
