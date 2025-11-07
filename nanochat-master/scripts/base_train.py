@@ -63,7 +63,7 @@ final_lr_frac = 0.0 # final LR is this fraction of the initial LR
 use_fsdp = True # enable Fully Sharded Data Parallel when possible
 activation_checkpoint = True # use activation checkpointing during training to save memory
 # Evaluation
-eval_every = 250 # every how many steps to evaluate the model for val bpb
+eval_every = 10 # every how many steps to evaluate the model for val bpb
 eval_tokens = 20*524288 # number of tokens to evaluate val loss on
 core_metric_every = 2000 # every how many steps to evaluate the core metric (-1 = disable)
 core_metric_max_per_task = 500 # examples per task in estimating the core metric
