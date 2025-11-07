@@ -322,15 +322,15 @@ def save_base_checkpoint(step_to_save):
             model_state = model.state_dict()
     else:
         model_state = orig_model.state_dict()
-    if not master_process:
-        return
-    save_checkpoint(
-        checkpoint_dir,
-        step_to_save,
-        model_state,
-        [opt.state_dict() for opt in optimizers],
-        meta,
-    )
+    if master_process:
+        optimizer_states = [opt.state_dict() for opt in optimizers]
+        save_checkpoint(
+            checkpoint_dir,
+            step_to_save,
+            model_state,
+            optimizer_states,
+            meta,
+        )
 
 # note that we run +1 steps only so that we can eval and save at the end
 for step in range(start_step, num_iterations + 1):

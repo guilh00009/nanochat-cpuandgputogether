@@ -156,25 +156,30 @@ if initial_last_checkpoint_step is not None and os.path.exists(os.path.join(chec
         raise
 
 def save_mid_checkpoint(step_to_save):
-    save_checkpoint(
-        checkpoint_dir,
-        step_to_save,
-        orig_model.state_dict(),
-        [opt.state_dict() for opt in optimizers],
-        {
-            "step": step_to_save,
-            "val_bpb": last_val_bpb,
-            "model_config": {
-                "sequence_len": max_seq_len,
-                "vocab_size": tokenizer.get_vocab_size(),
-                "n_layer": depth,
-                "n_head": model.config.n_head,
-                "n_kv_head": model.config.n_kv_head,
-                "n_embd": model.config.n_embd,
-            },
-            "user_config": user_config,
-        }
-    )
+    if dry_run:
+        return
+    model_state = orig_model.state_dict()
+    optimizer_states = [opt.state_dict() for opt in optimizers] if master_process else None
+    if master_process:
+        save_checkpoint(
+            checkpoint_dir,
+            step_to_save,
+            model_state,
+            optimizer_states,
+            {
+                "step": step_to_save,
+                "val_bpb": last_val_bpb,
+                "model_config": {
+                    "sequence_len": max_seq_len,
+                    "vocab_size": tokenizer.get_vocab_size(),
+                    "n_layer": depth,
+                    "n_head": model.config.n_head,
+                    "n_kv_head": model.config.n_kv_head,
+                    "n_embd": model.config.n_embd,
+                },
+                "user_config": user_config,
+            }
+        )
 
 identity_conversations_filepath = os.path.join(base_dir, "identity_conversations.jsonl")
 train_dataset = TaskMixture([
@@ -344,11 +349,11 @@ while True:
             "train/mfu": mfu,
         })
 
-    if master_process and not dry_run:
+    if not dry_run:
         save_due_to_interval = checkpoint_every > 0 and step > 0 and step % checkpoint_every == 0
         save_due_to_last_step = last_step
         if save_due_to_interval or save_due_to_last_step:
-            if last_checkpoint_step is not None and last_checkpoint_step != step:
+            if master_process and last_checkpoint_step is not None and last_checkpoint_step != step:
                 delete_checkpoint_files(checkpoint_dir, last_checkpoint_step)
             save_mid_checkpoint(step)
             last_checkpoint_step = step
