@@ -35,6 +35,7 @@ from nanochat.checkpoint_manager import save_checkpoint
 from nanochat.loss_eval import evaluate_bpb
 from nanochat.engine import Engine
 from scripts.base_eval import evaluate_model
+import torch.distributed as dist
 print_banner()
 
 # -----------------------------------------------------------------------------
@@ -68,7 +69,7 @@ eval_tokens = 20*524288 # number of tokens to evaluate val loss on
 core_metric_every = 2000 # every how many steps to evaluate the core metric (-1 = disable)
 core_metric_max_per_task = 500 # examples per task in estimating the core metric
 sample_every = 2000 # every how many steps to sample from the model
-checkpoint_every = 50 # every how many steps to write a checkpoint (<=0 = disable)
+checkpoint_every = 5 # every how many steps to write a checkpoint (<=0 = disable)
 # Output
 model_tag = "" # optionally override the model tag for the output checkpoint directory name
 # now allow CLI to override the settings via the configurator lol
@@ -149,9 +150,14 @@ fsdp_state_dict_config = None
 if use_fsdp:
     print0("[FSDP] Wrapping model with Fully Sharded Data Parallel.")
     auto_wrap_policy = partial(size_based_auto_wrap_policy, min_num_params=1_000_000)
-    fsdp_state_dict_config = FullStateDictConfig(offload_to_cpu=False, rank0_only=True)
+    fsdp_state_dict_config = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+    # ensure the process uses its local GPU
+    if torch.cuda.is_available():
+        torch.cuda.set_device(ddp_local_rank)
+
     def _fsdp_param_init_fn(module):
-        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        # use ddp_local_rank so parameters are placed on the right device for this process
+        device = torch.device(f"cuda:{ddp_local_rank}") if torch.cuda.is_available() else torch.device("cpu")
         module.to_empty(device=device)
         if hasattr(module, "init_weights"):
             module.init_weights()
@@ -289,6 +295,166 @@ def get_muon_momentum(it):
     frac = min(it / 300, 1)
     momentum = (1 - frac) * 0.85 + frac * 0.95
     return momentum
+
+# run this after FSDP wrapping and after any param_init_fn runs, before training starts
+def print_param_samples(model):
+    # try common problematic params
+    names_to_check = ["transformer.wte", "lm_head"]
+    for name, p in model.named_parameters():
+        for target in names_to_check:
+            if target in name:
+                try:
+                    arr = p.detach().cpu().view(-1)
+                    print0(f"[PARAM_SAMP] name={name} shape={tuple(p.shape)} mean={arr.float().mean().item():.6g} min={arr.min().item():.6g} max={arr.max().item():.6g} first10={arr[:10].tolist()}")
+                except Exception as e:
+                    print0(f"[PARAM_SAMP_ERR] name={name} err={e}")
+
+print_param_samples(model)
+torch.cuda.synchronize()
+
+def param_checksum(model):
+    s = 0.0
+    ct = 0
+    for name, p in model.named_parameters():
+        v = p.detach().cpu().view(-1)[:10]
+        s += float(v.sum().item())
+        ct += v.numel()
+        if ct > 100: break
+    return s
+
+print0(f"[CHECKSUM] rank={dist.get_rank()} cs={param_checksum(model)}")
+dist.barrier()
+
+def tensor_stats(t):
+    if not torch.is_tensor(t):
+        return str(type(t))
+    return f"shape={tuple(t.shape)} dtype={t.dtype} min={float(t.min()):.6g} max={float(t.max()):.6g} mean={float(t.float().mean()):.6g} any_nan={torch.isnan(t).any().item()} any_inf={torch.isinf(t).any().item()}"
+
+print0(f"[BATCH] rank={dist.get_rank()} x: {tensor_stats(x)} y: {tensor_stats(y)}")
+
+
+for name, p in model.named_parameters():
+    if "lm_head" in name:
+        print0(f"[LM_HEAD_INFO] name={name} shape={tuple(p.shape)} device={p.device} dtype={p.dtype} mean={float(p.detach().cpu().mean()):.6g} min={float(p.detach().cpu().min()):.6g} max={float(p.detach().cpu().max()):.6g}")
+
+# re-init lm_head and optionally tie to embedding
+with torch.no_grad():
+    for name, p in model.named_parameters():
+        if "lm_head" in name:
+            print0(f"[REINIT] reinitializing {name} on rank {dist.get_rank()}")
+            torch.nn.init.normal_(p, mean=0.0, std=0.02)   # or whatever your init scheme is
+
+# ensure all ranks see the same params: broadcast from rank 0
+for name, p in model.named_parameters():
+    if "lm_head" in name:
+        dist.broadcast(p, src=0)
+dist.barrier()
+print0("[REINIT] broadcast lm_head completed")
+
+
+# debug: rank / device / param checksum
+rank = dist.get_rank()
+local_rank = int(os.environ.get("LOCAL_RANK", -1))
+print0(f"[RANK INFO] rank={rank} local_rank={local_rank} device={torch.cuda.current_device()}")
+# compute a small checksum over a few params (deterministic)
+def param_checksum(model):
+    s = 0.0
+    ct = 0
+    for name, p in model.named_parameters():
+        if p.numel() == 0: continue
+        v = p.detach().cpu().view(-1)[:10]  # first 10 elems
+        s += float(v.sum().item())
+        ct += v.numel()
+        if ct > 100: break
+    return s
+print0(f"[PARAM_CHECKSUM] rank={rank} checksum={param_checksum(model)}")
+torch.cuda.synchronize()
+
+# Print dtype/device for head and embeddings on each rank
+for name, p in model.named_parameters():
+    if "wte" in name or "lm_head" in name:
+        print0(f"[TYPECHK] rank={dist.get_rank()} name={name} shape={tuple(p.shape)} device={p.device} dtype={p.dtype} mean={float(p.detach().cpu().mean()):.6g}")
+
+
+# Run on all ranks; do on rank 0 and broadcast to others to ensure identical state
+if dist.get_rank() == 0:
+    # collect raw parameters from the underlying module if needed
+    # If you wrapped already, get underlying raw model if available:
+    raw = getattr(model, "_fsdp_wrapped_module", model)
+    # init in float32 on CPU
+    with torch.no_grad():
+        for n, p in raw.named_parameters():
+            p_cpu = p.detach().cpu().float()
+            torch.nn.init.normal_(p_cpu, mean=0.0, std=0.02)
+            p.data = p_cpu.to(p.device, dtype=p.dtype)  # keep same dtype/device for now
+dist.barrier()
+# Broadcast params from rank 0 to all.
+for n, p in model.named_parameters():
+    try:
+        dist.broadcast(p, src=0)
+    except Exception as e:
+        print0(f"[BCAST_ERR] {n} err={e}")
+dist.barrier()
+print0("[REINIT] broadcast done")
+
+
+# find embedding and lm_head modules
+emb = None
+lm = None
+for n, m in model.named_modules():
+    if 'wte' in n or 'embed' in n.lower():
+        emb = m
+    if 'lm_head' in n:
+        lm = m
+print0(f"[FIND] emb={emb} lm={lm}")
+
+# run embedding forward and lm_head forward
+with torch.no_grad():
+    try:
+        emb_mod = emb._fsdp_wrapped_module if hasattr(emb, "_fsdp_wrapped_module") else emb
+        lm_mod = lm._fsdp_wrapped_module if hasattr(lm, "_fsdp_wrapped_module") else lm
+        emb_out = emb_mod(x.to(next(emb_mod.parameters()).device))
+        print0(f"[EMB] {tuple(emb_out.shape)} min={float(emb_out.min()):.6g} max={float(emb_out.max()):.6g} any_nan={torch.isnan(emb_out).any().item()}")
+        # create fake logits by projecting emb_out through lm_head (apply as Linear)
+        # flatten and run a small slice to avoid huge memory
+        sample = emb_out.view(-1, emb_out.size(-1))[:16]
+        lm_out = lm_mod(sample.to(next(lm_mod.parameters()).device))
+        print0(f"[LM_APPLY] {tuple(lm_out.shape)} min={float(lm_out.min()):.6g} max={float(lm_out.max()):.6g} any_nan={torch.isnan(lm_out).any().item()}")
+    except Exception as e:
+        print0(f"[SEP_ERR] err={e}")
+
+
+
+nan_found = {"flag": False}
+def forward_hook(module, inp, out):
+    try:
+        if isinstance(out, (tuple, list)):
+            tensors = [o for o in out if torch.is_tensor(o)]
+        elif torch.is_tensor(out):
+            tensors = [out]
+        else:
+            tensors = []
+        for t in tensors:
+            if not torch.isfinite(t).all():
+                #print0(f"[NAN_HIT] rank={dist.get_rank()} module={module.__class__.__name__} name={module} out_stats min={t.min()} max={t.max()}")
+                nan_found["flag"] = True
+    except Exception as e:
+        print0(f"[HOOK_ERR] rank={dist.get_rank()} module={module} err={e}")
+
+hooks = []
+for n, m in model.named_modules():
+    # keep it reasonable: skip tiny modules like LayerNorm wrappers if too noisy?
+    hooks.append(m.register_forward_hook(forward_hook))
+
+# run one forward only (ensure same input used across ranks)
+with autocast_ctx:
+    _ = model(x, y)
+torch.cuda.synchronize()
+for h in hooks:
+    h.remove()
+if nan_found["flag"]:
+    raise RuntimeError("NaN found in forward hooks")
+
 
 # -----------------------------------------------------------------------------
 # Training loop
@@ -441,26 +607,49 @@ for step in range(start_step, num_iterations + 1):
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
             loss = model(x, y)
-        train_loss = loss.detach() # for logging
-        loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
+
+        def tensor_stats(t):
+            return f"shape={tuple(t.shape)} dtype={t.dtype} min={t.min().item():.6g} max={t.max().item():.6g} mean={t.float().mean().item():.6g}"
+        print0(f"[INPUT] rank={dist.get_rank()} x: {tensor_stats(x)} y: {tensor_stats(y)}")
+
+        # Patch 4: NaN/Inf detection
+        if torch.isnan(loss) or torch.isinf(loss):
+            print0(f"[NaN DETECTED] step={step} micro_step={micro_step} loss={loss.item()}")
+            raise RuntimeError("NaN or Inf in loss")
+    
+        train_loss = loss.detach()  # for logging
+        loss = loss / grad_accum_steps  # each .backward() is a grad sum => normalize loss here
         loss.backward()
-        x, y = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
-    # gradient clipping (TODO possibly expertiment with)
+    
+        # Patch 5: Gradient stats
+        for name, p in model.named_parameters():
+            if p.grad is not None:
+                g = p.grad.detach()
+                #print0(f"[Grad] {name}: mean={g.float().mean().item():.3e}, max={g.float().max().item():.3e}")
+    
+        x, y = next(train_loader)  # prefetch the next batch while the GPU is busy with forward/backward
+    
+    # Patch 6: Gradient clipping diagnostics
     if grad_clip > 0.0:
         if use_fsdp:
-            model.clip_grad_norm_(grad_clip)
+            total_norm = model.clip_grad_norm_(grad_clip)
         else:
-            torch.nn.utils.clip_grad_norm_(orig_model.parameters(), grad_clip)
+            total_norm = torch.nn.utils.clip_grad_norm_(orig_model.parameters(), grad_clip)
+        print0(f"[GradClip] step={step} norm={total_norm:.3e}")
+    
     # step the optimizers
     lrm = get_lr_multiplier(step)
     for opt in optimizers:
         for group in opt.param_groups:
             group["lr"] = group["initial_lr"] * lrm
+    
     muon_momentum = get_muon_momentum(step)
     for group in muon_optimizer.param_groups:
         group["momentum"] = muon_momentum
+    
     for opt in optimizers:
         opt.step()
+    
     model.zero_grad(set_to_none=True)
     synchronize()
     t1 = time.time()

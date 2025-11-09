@@ -1,76 +1,55 @@
-"""
-Borrowed from modded-nanogpt. By Keller, @vagrawal, et al.
-Not a general optimizer! But works for our specific use.
-"""
 import torch
 import torch.distributed as dist
-from torch import Tensor
+from torch.optim import Optimizer
+from torch.nn.utils import clip_grad_norm_
 
-
-class DistAdamW(torch.optim.Optimizer):
-    """
-    Distributed AdamW optimizer.
-    In the style of ZeRO-2, i.e. sharded optimizer states and gradient reduction
-    """
-    def __init__(self, param_groups, lr: float = 1e-3, betas: tuple[float, float] = (0.9, 0.999), eps: float = 1e-8, weight_decay: float = 0.01):
+class DistAdamW(Optimizer):
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.01, grad_clip=None):
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
-        super().__init__(param_groups, defaults)
+        super().__init__(params, defaults)
+        self.grad_clip = grad_clip
 
-    @torch.compile
     @torch.no_grad()
-    def step(self):
-        rank = dist.get_rank()
-        world_size = dist.get_world_size()
-        reduce_scatter_futures: list[torch.Future] = []
-        all_reduce_futures: list[torch.Future] = []
-        grad_slices = []
-        for group in self.param_groups:
-            params: list[Tensor] = group["params"]
-            for base_i in range(len(params)):
-                grad = params[base_i].grad
-                rank_size = grad.shape[0] // world_size
-                grad_slice = torch.empty_like(grad[:rank_size])
-                reduce_scatter_futures.append(dist.reduce_scatter_tensor(grad_slice, grad, op=dist.ReduceOp.AVG, async_op=True).get_future())
-                grad_slices.append(grad_slice)
+    def step(self, closure=None):
+        if closure is not None:
+            with torch.enable_grad():
+                closure()
 
-        idx = 0
         for group in self.param_groups:
-            beta1, beta2 = group['betas']
-            eps = group['eps']
-            wd = group['weight_decay']
-            params = group['params']
-            for base in range(len(params)):
-                reduce_scatter_futures[idx].wait()
-                p = params[base]
-                rank_size = p.shape[0] // world_size
-                p_slice = p[rank * rank_size:(rank + 1) * rank_size]
-                lr = group['lr'] * getattr(p, "lr_mul", 1.0)
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+
+                grad = p.grad.detach()
+
+                # All-reduce to average gradients across all ranks
+                dist.all_reduce(grad, op=dist.ReduceOp.SUM)
+                grad.div_(dist.get_world_size())
+
+                if self.grad_clip is not None:
+                    clip_grad_norm_([p], self.grad_clip)
+
                 state = self.state[p]
-                g_slice = grad_slices[idx]
-                # State init
-                if not state:
-                    state['step'] = torch.tensor(0, dtype=torch.int64, device=p.device)
-                    state['exp_avg'] = torch.zeros_like(p_slice)
-                    state['exp_avg_sq'] = torch.zeros_like(p_slice)
-                exp_avg = state['exp_avg']
-                exp_avg_sq = state['exp_avg_sq']
-                state['step'] += 1
-                t = state['step']
-                # weight decay
-                if wd != 0:
-                    eff_weight_decay = lr * wd * getattr(p, "wd_mul", 1.0)
-                    p_slice.mul_(1 - eff_weight_decay)
-                # update running averages
-                exp_avg.mul_(beta1).add_(g_slice, alpha=1 - beta1)
-                exp_avg_sq.mul_(beta2).addcmul_(g_slice, g_slice, value=1 - beta2)
-                # bias corrections
-                bias1 = 1 - beta1 ** t
-                bias2 = 1 - beta2 ** t
-                # compute step
-                denom = exp_avg_sq.sqrt().add_(eps)
-                step_size = lr * (torch.sqrt(bias2) / bias1)
-                update = exp_avg.div(denom).mul_(step_size)
-                p_slice.add_(other=update, alpha=-1.0)
-                idx += 1
-                all_reduce_futures.append(dist.all_gather_into_tensor(p, p_slice, async_op=True).get_future())
-        torch.futures.collect_all(all_reduce_futures).wait()
+
+                # State initialization
+                if len(state) == 0:
+                    state["step"] = 0
+                    state["exp_avg"] = torch.zeros_like(p)
+                    state["exp_avg_sq"] = torch.zeros_like(p)
+
+                exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
+                beta1, beta2 = group["betas"]
+
+                state["step"] += 1
+
+                # Decay the first and second moment running average coefficient
+                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+
+                denom = exp_avg_sq.sqrt().add_(group["eps"])
+
+                step_size = group["lr"]
+                if group["weight_decay"] != 0:
+                    p.data.add_(p.data, alpha=-group["lr"] * group["weight_decay"])
+
+                p.data.addcdiv_(exp_avg, denom, value=-step_size)
