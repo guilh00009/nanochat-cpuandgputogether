@@ -117,11 +117,11 @@ fi
 
 BEST_DBSZ="${DEVICE_BATCH_SIZE_OVERRIDE:-1}"
 BEST_DEPTH="${DEPTH_OVERRIDE:-92}"
-BEST_SEQLEN="${SEQ_LEN_OVERRIDE:-2048}"
+BEST_SEQLEN="${SEQ_LEN_OVERRIDE:-4096}"
 
 # ---------- 6) Global knobs for 40GB -----------------------------------------
 BASE_TOTAL_BATCH=262144     # 256k tokens
-EVAL_EVERY=250
+EVAL_EVERY=25
 EVAL_TOKENS=4096
 BASE_ITERS=8000             # long run; adjust if needed
 

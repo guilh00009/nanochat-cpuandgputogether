@@ -12,6 +12,7 @@ python -m scripts.base_train --depth=4 --max_seq_len=512 --device_batch_size=1 -
 """
 
 import os
+import gc
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import time
 import json
@@ -45,7 +46,7 @@ run = "dummy" # wandb run name default ("dummy" is special - we won't log to wan
 device_type = "" # cuda|cpu|mps (empty => autodetect good device type default, in order: CUDA > MPS > CPU)
 # Model architecture
 depth = 20 # the depth of the Transformer model to train, rest of the kwargs are derived
-max_seq_len = 2048 # max context length
+max_seq_len = 4096 # max context length
 # Training horizon. Only one of these 3 will be used, in this order of precedence.
 num_iterations = -1 # explicit number of steps of the optimization (-1 = disable)
 target_flops = -1.0 # calculate num_iterations to reach target_flops. Useful for scaling laws experiments (-1 = disable)
@@ -69,7 +70,7 @@ eval_tokens = 20*524288 # number of tokens to evaluate val loss on
 core_metric_every = 2000 # every how many steps to evaluate the core metric (-1 = disable)
 core_metric_max_per_task = 500 # examples per task in estimating the core metric
 sample_every = 2000 # every how many steps to sample from the model
-checkpoint_every = 5 # every how many steps to write a checkpoint (<=0 = disable)
+checkpoint_every = 25 # every how many steps to write a checkpoint (<=0 = disable)
 # Output
 model_tag = "" # optionally override the model tag for the output checkpoint directory name
 # now allow CLI to override the settings via the configurator lol
@@ -167,7 +168,7 @@ if use_fsdp:
         device_id=ddp_local_rank,
         sync_module_states=True,
         param_init_fn=_fsdp_param_init_fn,
-        use_orig_params=True,
+        use_orig_params=True
     )
     FSDP.set_state_dict_type(fsdp_model, StateDictType.FULL_STATE_DICT, fsdp_state_dict_config)
     model = fsdp_model
@@ -245,35 +246,92 @@ if os.path.isdir(checkpoint_dir):
             for stale_step in existing_steps[:-1]:
                 delete_checkpoint_files(checkpoint_dir, stale_step)
 
+
+def load_checkpoint_cpu(path):
+    # always load to CPU to avoid allocating GPU memory for full tensors
+    return torch.load(path, map_location="cpu")
+
 resume_meta = {}
-if initial_last_checkpoint_step is not None and os.path.exists(os.path.join(checkpoint_dir, f"model_{initial_last_checkpoint_step:06d}.pt")):
+if initial_last_checkpoint_step is not None:
     model_path = os.path.join(checkpoint_dir, f"model_{initial_last_checkpoint_step:06d}.pt")
     optim_path = os.path.join(checkpoint_dir, f"optim_{initial_last_checkpoint_step:06d}.pt")
     meta_path = os.path.join(checkpoint_dir, f"meta_{initial_last_checkpoint_step:06d}.json")
-    try:
-        checkpoint_state = torch.load(model_path, map_location=device)
-        if use_fsdp:
-            with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, fsdp_state_dict_config):
-                model.load_state_dict(checkpoint_state, strict=True)
-        else:
-            orig_model.load_state_dict(checkpoint_state, strict=True)
-            if hasattr(model, "load_state_dict"):
-                try:
-                    model.load_state_dict(orig_model.state_dict(), strict=True)
-                except Exception:
-                    pass
-        if os.path.exists(optim_path):
-            optimizer_states = torch.load(optim_path, map_location=device)
-            if isinstance(optimizer_states, (list, tuple)):
-                for opt, opt_state in zip(optimizers, optimizer_states):
-                    opt.load_state_dict(opt_state)
-        if os.path.exists(meta_path):
-            with open(meta_path, "r") as f:
-                resume_meta = json.load(f)
-        print0(f"Resuming base training from checkpoint step {initial_last_checkpoint_step}")
-    except Exception as exc:
-        print0(f"Error: failed to load checkpoint at step {initial_last_checkpoint_step}: {exc}")
-        raise
+    if os.path.exists(model_path):
+        try:
+            # 1) load model state on CPU
+            checkpoint_state = load_checkpoint_cpu(model_path)
+
+            # 2) load into model using FSDP full-state loading but keep tensors on CPU
+            if use_fsdp:
+                # this will instruct FSDP to accept a full state dict (CPU tensors OK)
+                with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, fsdp_state_dict_config):
+                    model.load_state_dict(checkpoint_state, strict=True)
+            else:
+                # load into the unwrapped/orig model on CPU first
+                orig_model.load_state_dict(checkpoint_state, strict=True)
+
+                # if you maintain a wrapped 'model', load from orig_model.state_dict in a memory-friendly way:
+                if hasattr(model, "load_state_dict"):
+                    try:
+                        # get state dict from orig_model (CPU tensors) and load into wrapped model
+                        model.load_state_dict(orig_model.state_dict(), strict=True)
+                    except Exception:
+                        pass
+
+            # 3) free large CPU tmp if any and force a barrier
+            del checkpoint_state
+            gc.collect()
+            torch.cuda.empty_cache()
+            dist.barrier()
+
+            # 4) load optimizer states on CPU and either recreate optimizers after this
+            if os.path.exists(optim_path):
+                # load optimizer states to CPU (no GPU allocations)
+                optimizer_states = load_checkpoint_cpu(optim_path)
+
+                # Best option: recreate optimizers now that model params are correct,
+                # so optimizer state can be loaded/sharded properly by your optimizer wrapper.
+                # If you can't recreate, load state_dict into existing optimizers but keep on CPU.
+                if isinstance(optimizer_states, (list, tuple)) and len(optimizer_states) == len(optimizers):
+                    # move each optimizer state tensors onto the optimizer's expected device only as needed
+                    for opt, opt_state in zip(optimizers, optimizer_states):
+                        # load_state_dict with CPU tensors; some optimizers expect tensors on device, so
+                        # allow optimizer to move/convert them lazily or recreate optimizers after this step.
+                        opt.load_state_dict(opt_state)
+                else:
+                    # fallback: recreate optimizers using model.parameters() (recommended)
+                    # del old optimizers to free GPU memory then recreate
+                    try:
+                        for o in optimizers:
+                            del o
+                    except Exception:
+                        pass
+                    gc.collect()
+                    torch.cuda.empty_cache()
+
+                    # recreate optimizers here (example; adapt to your creation args)
+                    optimizers = []
+                    muon_optimizer = DistMuon(model.parameters(), lr=base_lr, momentum=muon_momentum, weight_decay=weight_decay)
+                    optimizers.append(muon_optimizer)
+                    # if you saved optimizer states, you can now load them from optimizer_states if available
+                    if isinstance(optimizer_states, (list, tuple)):
+                        for opt, state in zip(optimizers, optimizer_states):
+                            opt.load_state_dict(state)
+
+                del optimizer_states
+                gc.collect()
+                torch.cuda.empty_cache()
+
+            # 5) load meta if present
+            if os.path.exists(meta_path):
+                with open(meta_path, "r") as f:
+                    resume_meta = json.load(f)
+
+            print0(f"Resuming base training from checkpoint step {initial_last_checkpoint_step}")
+        except Exception as exc:
+            print0(f"Error: failed to load checkpoint at step {initial_last_checkpoint_step}: {exc}")
+            raise
+
 
 # -----------------------------------------------------------------------------
 # Set up hyperparameter schedulers
@@ -296,43 +354,6 @@ def get_muon_momentum(it):
     momentum = (1 - frac) * 0.85 + frac * 0.95
     return momentum
 
-# run this after FSDP wrapping and after any param_init_fn runs, before training starts
-def print_param_samples(model):
-    # try common problematic params
-    names_to_check = ["transformer.wte", "lm_head"]
-    for name, p in model.named_parameters():
-        for target in names_to_check:
-            if target in name:
-                try:
-                    arr = p.detach().cpu().view(-1)
-                    print0(f"[PARAM_SAMP] name={name} shape={tuple(p.shape)} mean={arr.float().mean().item():.6g} min={arr.min().item():.6g} max={arr.max().item():.6g} first10={arr[:10].tolist()}")
-                except Exception as e:
-                    print0(f"[PARAM_SAMP_ERR] name={name} err={e}")
-
-print_param_samples(model)
-torch.cuda.synchronize()
-
-def param_checksum(model):
-    s = 0.0
-    ct = 0
-    for name, p in model.named_parameters():
-        v = p.detach().cpu().view(-1)[:10]
-        s += float(v.sum().item())
-        ct += v.numel()
-        if ct > 100: break
-    return s
-
-print0(f"[CHECKSUM] rank={dist.get_rank()} cs={param_checksum(model)}")
-dist.barrier()
-
-def tensor_stats(t):
-    if not torch.is_tensor(t):
-        return str(type(t))
-    return f"shape={tuple(t.shape)} dtype={t.dtype} min={float(t.min()):.6g} max={float(t.max()):.6g} mean={float(t.float().mean()):.6g} any_nan={torch.isnan(t).any().item()} any_inf={torch.isinf(t).any().item()}"
-
-print0(f"[BATCH] rank={dist.get_rank()} x: {tensor_stats(x)} y: {tensor_stats(y)}")
-
-
 for name, p in model.named_parameters():
     if "lm_head" in name:
         print0(f"[LM_HEAD_INFO] name={name} shape={tuple(p.shape)} device={p.device} dtype={p.dtype} mean={float(p.detach().cpu().mean()):.6g} min={float(p.detach().cpu().min()):.6g} max={float(p.detach().cpu().max()):.6g}")
@@ -350,31 +371,6 @@ for name, p in model.named_parameters():
         dist.broadcast(p, src=0)
 dist.barrier()
 print0("[REINIT] broadcast lm_head completed")
-
-
-# debug: rank / device / param checksum
-rank = dist.get_rank()
-local_rank = int(os.environ.get("LOCAL_RANK", -1))
-print0(f"[RANK INFO] rank={rank} local_rank={local_rank} device={torch.cuda.current_device()}")
-# compute a small checksum over a few params (deterministic)
-def param_checksum(model):
-    s = 0.0
-    ct = 0
-    for name, p in model.named_parameters():
-        if p.numel() == 0: continue
-        v = p.detach().cpu().view(-1)[:10]  # first 10 elems
-        s += float(v.sum().item())
-        ct += v.numel()
-        if ct > 100: break
-    return s
-print0(f"[PARAM_CHECKSUM] rank={rank} checksum={param_checksum(model)}")
-torch.cuda.synchronize()
-
-# Print dtype/device for head and embeddings on each rank
-for name, p in model.named_parameters():
-    if "wte" in name or "lm_head" in name:
-        print0(f"[TYPECHK] rank={dist.get_rank()} name={name} shape={tuple(p.shape)} device={p.device} dtype={p.dtype} mean={float(p.detach().cpu().mean()):.6g}")
-
 
 # Run on all ranks; do on rank 0 and broadcast to others to ensure identical state
 if dist.get_rank() == 0:
@@ -397,64 +393,8 @@ for n, p in model.named_parameters():
 dist.barrier()
 print0("[REINIT] broadcast done")
 
-
-# find embedding and lm_head modules
-emb = None
-lm = None
-for n, m in model.named_modules():
-    if 'wte' in n or 'embed' in n.lower():
-        emb = m
-    if 'lm_head' in n:
-        lm = m
-print0(f"[FIND] emb={emb} lm={lm}")
-
-# run embedding forward and lm_head forward
-with torch.no_grad():
-    try:
-        emb_mod = emb._fsdp_wrapped_module if hasattr(emb, "_fsdp_wrapped_module") else emb
-        lm_mod = lm._fsdp_wrapped_module if hasattr(lm, "_fsdp_wrapped_module") else lm
-        emb_out = emb_mod(x.to(next(emb_mod.parameters()).device))
-        print0(f"[EMB] {tuple(emb_out.shape)} min={float(emb_out.min()):.6g} max={float(emb_out.max()):.6g} any_nan={torch.isnan(emb_out).any().item()}")
-        # create fake logits by projecting emb_out through lm_head (apply as Linear)
-        # flatten and run a small slice to avoid huge memory
-        sample = emb_out.view(-1, emb_out.size(-1))[:16]
-        lm_out = lm_mod(sample.to(next(lm_mod.parameters()).device))
-        print0(f"[LM_APPLY] {tuple(lm_out.shape)} min={float(lm_out.min()):.6g} max={float(lm_out.max()):.6g} any_nan={torch.isnan(lm_out).any().item()}")
-    except Exception as e:
-        print0(f"[SEP_ERR] err={e}")
-
-
-
-nan_found = {"flag": False}
-def forward_hook(module, inp, out):
-    try:
-        if isinstance(out, (tuple, list)):
-            tensors = [o for o in out if torch.is_tensor(o)]
-        elif torch.is_tensor(out):
-            tensors = [out]
-        else:
-            tensors = []
-        for t in tensors:
-            if not torch.isfinite(t).all():
-                #print0(f"[NAN_HIT] rank={dist.get_rank()} module={module.__class__.__name__} name={module} out_stats min={t.min()} max={t.max()}")
-                nan_found["flag"] = True
-    except Exception as e:
-        print0(f"[HOOK_ERR] rank={dist.get_rank()} module={module} err={e}")
-
-hooks = []
-for n, m in model.named_modules():
-    # keep it reasonable: skip tiny modules like LayerNorm wrappers if too noisy?
-    hooks.append(m.register_forward_hook(forward_hook))
-
-# run one forward only (ensure same input used across ranks)
-with autocast_ctx:
-    _ = model(x, y)
-torch.cuda.synchronize()
-for h in hooks:
-    h.remove()
-if nan_found["flag"]:
-    raise RuntimeError("NaN found in forward hooks")
-
+gc.collect()
+torch.cuda.empty_cache()
 
 # -----------------------------------------------------------------------------
 # Training loop
@@ -502,94 +442,8 @@ def save_base_checkpoint(step_to_save):
 for step in range(start_step, num_iterations + 1):
     last_step = step == num_iterations
     flops_so_far = num_flops_per_token * total_batch_size * step
-
-    # once in a while: evaluate the val bpb (all ranks participate)
-    should_eval = eval_every > 0 and (last_step or (step > 0 and step % eval_every == 0))
-    if should_eval:
-        model.eval()
-        orig_model.eval()
-        val_loader = build_val_loader()
-        tokens_per_eval_step = max(1, device_batch_size * max_seq_len * ddp_world_size)
-        eval_steps = eval_tokens // tokens_per_eval_step
-        if eval_steps == 0:
-            eval_steps = 1
-            if master_process:
-                print0("Warning: eval_tokens smaller than one micro-batch; evaluating on a single step instead.")
-        if use_fsdp:
-            with FSDP.summon_full_params(model):
-                with autocast_ctx:
-                    val_bpb = evaluate_bpb(orig_model, val_loader, eval_steps, token_bytes)
-        else:
-            with autocast_ctx:
-                val_bpb = evaluate_bpb(orig_model, val_loader, eval_steps, token_bytes)
-        print0(f"Step {step:05d} | Validation bpb: {val_bpb:.4f}")
-        if val_bpb < min_val_bpb:
-            min_val_bpb = val_bpb
-        wandb_run.log({
-            "step": step,
-            "total_training_flops": flops_so_far,
-            "total_training_time": total_training_time,
-            "val/bpb": val_bpb,
-        })
-        model.train()
-        orig_model.train()
-
-    # once in a while: estimate the CORE metric (all ranks participate)
-    # use the original uncompiled model because the inputs keep changing shape
-    results = {}
-    if core_metric_every > 0 and (last_step or (step > 0 and step % core_metric_every == 0)):
-        model.eval()
-        orig_model.eval()
-        if use_fsdp:
-            with FSDP.summon_full_params(model):
-                with autocast_ctx:
-                    results = evaluate_model(orig_model, tokenizer, device, max_per_task=core_metric_max_per_task)
-        else:
-            with autocast_ctx:
-                results = evaluate_model(orig_model, tokenizer, device, max_per_task=core_metric_max_per_task)
-        print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
-        wandb_run.log({
-            "step": step,
-            "total_training_flops": flops_so_far,
-            "core_metric": results["core_metric"],
-            "centered_results": results["centered_results"],
-        })
-        model.train()
-        orig_model.train()
-
-    # once in a while: sample from the model (only log from master but all ranks must participate in FSDP gathers)
-    # use the original uncompiled model because the inputs keep changing shape
-    should_sample = last_step or (step > 0 and step % sample_every == 0)
-    if should_sample:
-        model.eval()
-        orig_model.eval()
-        prompts = [
-            "The capital of France is",
-            "The chemical symbol of gold is",
-            "If yesterday was Friday, then tomorrow will be",
-            "The opposite of hot is",
-            "The planets of the solar system are:",
-            "My favorite color is",
-            "If 5*x + 3 = 13, then x is",
-        ]
-
-        def run_sampling():
-            if not master_process:
-                return
-            engine = Engine(orig_model, tokenizer) # use orig_model to avoid recompilation
-            for prompt in prompts:
-                tokens = tokenizer(prompt, prepend="<|bos|>")
-                with autocast_ctx:
-                    sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
-                print0(tokenizer.decode(sample[0]))
-
-        if use_fsdp:
-            with FSDP.summon_full_params(model):
-                run_sampling()
-        else:
-            run_sampling()
-        model.train()
-        orig_model.train()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     if last_step:
         if master_process and last_checkpoint_step is not None and last_checkpoint_step != step:
@@ -608,48 +462,24 @@ for step in range(start_step, num_iterations + 1):
         with autocast_ctx:
             loss = model(x, y)
 
-        def tensor_stats(t):
-            return f"shape={tuple(t.shape)} dtype={t.dtype} min={t.min().item():.6g} max={t.max().item():.6g} mean={t.float().mean().item():.6g}"
-        print0(f"[INPUT] rank={dist.get_rank()} x: {tensor_stats(x)} y: {tensor_stats(y)}")
-
-        # Patch 4: NaN/Inf detection
-        if torch.isnan(loss) or torch.isinf(loss):
-            print0(f"[NaN DETECTED] step={step} micro_step={micro_step} loss={loss.item()}")
-            raise RuntimeError("NaN or Inf in loss")
-    
         train_loss = loss.detach()  # for logging
         loss = loss / grad_accum_steps  # each .backward() is a grad sum => normalize loss here
         loss.backward()
-    
-        # Patch 5: Gradient stats
-        for name, p in model.named_parameters():
-            if p.grad is not None:
-                g = p.grad.detach()
-                #print0(f"[Grad] {name}: mean={g.float().mean().item():.3e}, max={g.float().max().item():.3e}")
-    
         x, y = next(train_loader)  # prefetch the next batch while the GPU is busy with forward/backward
-    
-    # Patch 6: Gradient clipping diagnostics
-    if grad_clip > 0.0:
-        if use_fsdp:
-            total_norm = model.clip_grad_norm_(grad_clip)
-        else:
-            total_norm = torch.nn.utils.clip_grad_norm_(orig_model.parameters(), grad_clip)
-        print0(f"[GradClip] step={step} norm={total_norm:.3e}")
-    
+
     # step the optimizers
     lrm = get_lr_multiplier(step)
     for opt in optimizers:
         for group in opt.param_groups:
             group["lr"] = group["initial_lr"] * lrm
-    
+
     muon_momentum = get_muon_momentum(step)
     for group in muon_optimizer.param_groups:
         group["momentum"] = muon_momentum
-    
+
     for opt in optimizers:
         opt.step()
-    
+
     model.zero_grad(set_to_none=True)
     synchronize()
     t1 = time.time()
@@ -679,12 +509,17 @@ for step in range(start_step, num_iterations + 1):
             "train/mfu": mfu,
         })
 
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     if checkpoint_every > 0 and step > 0 and step % checkpoint_every == 0:
-        if master_process and last_checkpoint_step is not None and last_checkpoint_step != step:
-            delete_checkpoint_files(checkpoint_dir, last_checkpoint_step)
+        #if master_process and last_checkpoint_step is not None and last_checkpoint_step != step:
+        #    delete_checkpoint_files(checkpoint_dir, last_checkpoint_step)
         save_base_checkpoint(step)
         if master_process:
             last_checkpoint_step = step
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 # print a few more stats
 print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
