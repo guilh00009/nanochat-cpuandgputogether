@@ -1,0 +1,642 @@
+diff --git a/nanochat-master/nanochat/adamw.py b/nanochat-master/nanochat/adamw.py
+index db591de..42a77bb 100644
+--- a/nanochat-master/nanochat/adamw.py
++++ b/nanochat-master/nanochat/adamw.py
+@@ -1,76 +1,55 @@
+-"""
+-Borrowed from modded-nanogpt. By Keller, @vagrawal, et al.
+-Not a general optimizer! But works for our specific use.
+-"""
+ import torch
+ import torch.distributed as dist
+-from torch import Tensor
++from torch.optim import Optimizer
++from torch.nn.utils import clip_grad_norm_
+ 
+-
+-class DistAdamW(torch.optim.Optimizer):
+-    """
+-    Distributed AdamW optimizer.
+-    In the style of ZeRO-2, i.e. sharded optimizer states and gradient reduction
+-    """
+-    def __init__(self, param_groups, lr: float = 1e-3, betas: tuple[float, float] = (0.9, 0.999), eps: float = 1e-8, weight_decay: float = 0.01):
++class DistAdamW(Optimizer):
++    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0.01, grad_clip=None):
+         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+-        super().__init__(param_groups, defaults)
++        super().__init__(params, defaults)
++        self.grad_clip = grad_clip
+ 
+-    @torch.compile
+     @torch.no_grad()
+-    def step(self):
+-        rank = dist.get_rank()
+-        world_size = dist.get_world_size()
+-        reduce_scatter_futures: list[torch.Future] = []
+-        all_reduce_futures: list[torch.Future] = []
+-        grad_slices = []
+-        for group in self.param_groups:
+-            params: list[Tensor] = group["params"]
+-            for base_i in range(len(params)):
+-                grad = params[base_i].grad
+-                rank_size = grad.shape[0] // world_size
+-                grad_slice = torch.empty_like(grad[:rank_size])
+-                reduce_scatter_futures.append(dist.reduce_scatter_tensor(grad_slice, grad, op=dist.ReduceOp.AVG, async_op=True).get_future())
+-                grad_slices.append(grad_slice)
++    def step(self, closure=None):
++        if closure is not None:
++            with torch.enable_grad():
++                closure()
+ 
+-        idx = 0
+         for group in self.param_groups:
+-            beta1, beta2 = group['betas']
+-            eps = group['eps']
+-            wd = group['weight_decay']
+-            params = group['params']
+-            for base in range(len(params)):
+-                reduce_scatter_futures[idx].wait()
+-                p = params[base]
+-                rank_size = p.shape[0] // world_size
+-                p_slice = p[rank * rank_size:(rank + 1) * rank_size]
+-                lr = group['lr'] * getattr(p, "lr_mul", 1.0)
++            for p in group["params"]:
++                if p.grad is None:
++                    continue
++
++                grad = p.grad.detach()
++
++                # All-reduce to average gradients across all ranks
++                dist.all_reduce(grad, op=dist.ReduceOp.SUM)
++                grad.div_(dist.get_world_size())
++
++                if self.grad_clip is not None:
++                    clip_grad_norm_([p], self.grad_clip)
++
+                 state = self.state[p]
+-                g_slice = grad_slices[idx]
+-                # State init
+-                if not state:
+-                    state['step'] = torch.tensor(0, dtype=torch.int64, device=p.device)
+-                    state['exp_avg'] = torch.zeros_like(p_slice)
+-                    state['exp_avg_sq'] = torch.zeros_like(p_slice)
+-                exp_avg = state['exp_avg']
+-                exp_avg_sq = state['exp_avg_sq']
+-                state['step'] += 1
+-                t = state['step']
+-                # weight decay
+-                if wd != 0:
+-                    eff_weight_decay = lr * wd * getattr(p, "wd_mul", 1.0)
+-                    p_slice.mul_(1 - eff_weight_decay)
+-                # update running averages
+-                exp_avg.mul_(beta1).add_(g_slice, alpha=1 - beta1)
+-                exp_avg_sq.mul_(beta2).addcmul_(g_slice, g_slice, value=1 - beta2)
+-                # bias corrections
+-                bias1 = 1 - beta1 ** t
+-                bias2 = 1 - beta2 ** t
+-                # compute step
+-                denom = exp_avg_sq.sqrt().add_(eps)
+-                step_size = lr * (torch.sqrt(bias2) / bias1)
+-                update = exp_avg.div(denom).mul_(step_size)
+-                p_slice.add_(other=update, alpha=-1.0)
+-                idx += 1
+-                all_reduce_futures.append(dist.all_gather_into_tensor(p, p_slice, async_op=True).get_future())
+-        torch.futures.collect_all(all_reduce_futures).wait()
++
++                # State initialization
++                if len(state) == 0:
++                    state["step"] = 0
++                    state["exp_avg"] = torch.zeros_like(p)
++                    state["exp_avg_sq"] = torch.zeros_like(p)
++
++                exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
++                beta1, beta2 = group["betas"]
++
++                state["step"] += 1
++
++                # Decay the first and second moment running average coefficient
++                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
++                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
++
++                denom = exp_avg_sq.sqrt().add_(group["eps"])
++
++                step_size = group["lr"]
++                if group["weight_decay"] != 0:
++                    p.data.add_(p.data, alpha=-group["lr"] * group["weight_decay"])
++
++                p.data.addcdiv_(exp_avg, denom, value=-step_size)
+diff --git a/nanochat-master/nanochat/muon.py b/nanochat-master/nanochat/muon.py
+index 15e5585..1a35a1c 100644
+--- a/nanochat-master/nanochat/muon.py
++++ b/nanochat-master/nanochat/muon.py
+@@ -1,178 +1,86 @@
+-"""
+-Muon optimizer from Keller et al.
+-(robust to 1D params; bf16 on GPU; dynamo-safe)
+-"""
+-from __future__ import annotations
+ import torch
+-from torch import Tensor
+ import torch.distributed as dist
++from torch.optim import Optimizer
+ 
+-# ---- Newton–Schulz orthogonalization (no torch.compile aqui) ----
+-def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
+-    """
+-    Newton–Schulz iteration to approx. orthogonalize G (2D or batched 2D).
+-    Runs safely in bf16 on GPU. Exige G.ndim >= 2.
+-    """
+-    if G.ndim < 2:
+-        # Não deveria chegar aqui (filtramos no step), mas garantimos fallback.
+-        return G
+-
+-    a, b, c = (3.4445, -4.7750, 2.0315)
+-
+-    # Mantém dispositivo, força bf16 se suportado
+-    if torch.cuda.is_available():
+-        X = G.to(dtype=torch.bfloat16, device=G.device, non_blocking=True)
+-    else:
+-        # Em CPU, bf16 pode não ter kernel ótimo -> use float32
+-        X = G.to(dtype=torch.bfloat16 if torch.bfloat16.is_floating_point else torch.float32)
+-
+-    # Trabalha com matrizes "altas" para melhor estabilidade
+-    need_T = X.size(-2) > X.size(-1)
+-    if need_T:
+-        X = X.mT
+-
+-    # Normaliza pelo espectro (<=1). Usa norma Fro como bound barato para batched.
+-    # (norm over last two dims; evita underflow com eps)
+-    eps = torch.tensor(1e-7, dtype=X.dtype, device=X.device)
+-    denom = X.norm(dim=(-2, -1), keepdim=True) + eps
+-    X = X / denom
+-
+-    # Iterações Newton–Schulz (quintic)
+-    for _ in range(int(steps)):
+-        A = X @ X.mT                   # [*, m, m]
+-        B = b * A + c * (A @ A)        # quintic approx
+-        X = a * X + B @ X
+-
+-    if need_T:
+-        X = X.mT
+-    return X
+-
+-# --------------------------- Muon (single-process) ---------------------------
+-class Muon(torch.optim.Optimizer):
+-    """
+-    Muon - SGD-momentum + (optional) Nesterov, then orthogonalize 2D updates.
+-    ⚠️ Não use em {0,1}D (embedding, bias, etc.). Estes são ignorados aqui.
+-    """
+-    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5):
+-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
+-        # Agrupa apenas por numel para cache-friendly (como você tinha)
+-        params = [*params]
+-        param_groups = []
+-        for size in {p.numel() for p in params}:
+-            group = dict(params=[p for p in params if p.numel() == size])
+-            param_groups.append(group)
+-        super().__init__(param_groups, defaults)
++class Muon(Optimizer):
++    def __init__(self, params, lr=1e-3, momentum=0.9, weight_decay=0.01, dampening=0.0, nesterov=True):
++        defaults = dict(lr=lr, momentum=momentum, weight_decay=weight_decay, dampening=dampening, nesterov=nesterov)
++        super().__init__(params, defaults)
+ 
+     @torch.no_grad()
+-    def step(self):
+-        for group in self.param_groups:
+-            params: list[Tensor] = group["params"]
+-            for p in params:
+-                g = p.grad
+-                if g is None:
+-                    continue
++    def step(self, closure=None):
++        if closure is not None:
++            with torch.enable_grad():
++                closure()
+ 
+-                # Pule params não 2D (bias/embeddings/fc-out). Use outro otimizador para eles.
+-                if p.ndim < 2 or g.ndim < 2:
++        for group in self.param_groups:
++            for p in group["params"]:
++                if p.grad is None:
+                     continue
+ 
+-                # Momentum buffer
+-                state = self.state[p]
+-                if "momentum_buffer" not in state:
+-                    state["momentum_buffer"] = torch.zeros_like(g)
+-                buf: Tensor = state["momentum_buffer"]
+-
+-                # SGD-momentum + (opcional) Nesterov
+-                buf.lerp_(g, 1.0 - group["momentum"])
+-                g = g.lerp_(buf, group["momentum"]) if group["nesterov"] else buf
+-
+-                # Orthogonalize update (bf16 GPU-friendly)
+-                g = zeropower_via_newtonschulz5(g, steps=group["ns_steps"])
+-
+-                # Aspect-ratio scaling
+-                scale = float(max(1.0, p.size(-2) / p.size(-1)) ** 0.5)
+-                p.add_(g, alpha=-group["lr"] * scale)
+-
+-# --------------------------- Muon (Distributed) ---------------------------
+-class DistMuon(torch.optim.Optimizer):
+-    """
+-    Distributed Muon:
+-      - reduce_scatter(AVG) para grads
+-      - owner rank aplica Muon update
+-      - all_gather para replicar pesos atualizados
+-    Apenas para parâmetros 2D. Outros devem ficar em outro optimizer/grupo.
+-    """
+-    def __init__(self, params, lr: float = 0.02, momentum: float = 0.95,
+-                 nesterov: bool = True, ns_steps: int = 5):
+-        assert dist.is_initialized(), "torch.distributed must be initialized before DistMuon."
+-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
+-
+-        params = [p for p in params if p.ndim == 2]  # garante 2D
+-        if len(params) == 0:
+-            raise ValueError("DistMuon received no 2D parameters.")
+-
+-        # Agrupar por shape para buffers compatíveis
+-        shapes = sorted({tuple(p.shape) for p in params})
+-        param_groups = []
+-        for shape in shapes:
+-            group_params = [p for p in params if tuple(p.shape) == shape]
+-            device, dtype = group_params[0].device, group_params[0].dtype
+-            assert all(p.device == device for p in group_params)
+-            assert all(p.dtype == dtype for p in group_params)
+-            zero_buffer = torch.zeros(shape, device=device, dtype=dtype)
+-            param_groups.append(dict(params=group_params, zero_buffer=zero_buffer))
+-        super().__init__(param_groups, defaults)
++                d_p = p.grad
++                if group["weight_decay"] != 0:
++                    d_p = d_p.add(p.data, alpha=group["weight_decay"])
++
++                if group["momentum"] != 0:
++                    param_state = self.state[p]
++                    if "momentum_buffer" not in param_state:
++                        buf = param_state["momentum_buffer"] = torch.clone(d_p).detach()
++                    else:
++                        buf = param_state["momentum_buffer"]
++                        buf.mul_(group["momentum"]).add_(d_p, alpha=1 - group["dampening"])
++                    if group["nesterov"]:
++                        d_p = d_p.add(buf, alpha=group["momentum"])
++                    else:
++                        d_p = buf
++
++                p.data.add_(d_p, alpha=-group["lr"])
++
++class DistMuon(Optimizer):
++    def __init__(self, params, lr=1e-3, momentum=0.9, weight_decay=0.01, dampening=0.0, nesterov=True):
++        defaults = dict(lr=lr, momentum=momentum, weight_decay=weight_decay, dampening=dampening, nesterov=nesterov)
++        super().__init__(params, defaults)
++        self.rank = dist.get_rank()
++        self.world_size = dist.get_world_size()
+ 
+     @torch.no_grad()
+-    def step(self):
+-        rank = dist.get_rank()
+-        world = dist.get_world_size()
++    def step(self, closure=None):
++        if closure is not None:
++            with torch.enable_grad():
++                closure()
+ 
+-        # Verifica grads
+         for group in self.param_groups:
++            lr = group["lr"]
++            momentum = group["momentum"]
++            weight_decay = group["weight_decay"]
++            dampening = group["dampening"]
++            nesterov = group["nesterov"]
++
+             for p in group["params"]:
+                 if p.grad is None:
+-                    raise RuntimeError("All params must have grads for DistMuon.")
++                    continue
+ 
+-        for group in self.param_groups:
+-            params = group["params"]
+-            zero_buffer = group["zero_buffer"]
+-
+-            # Processa em janelas de tamanho 'world'
+-            for base in range(0, len(params), world):
+-                # Índice do dono (owner) nesta janela
+-                owner_idx = base + rank
+-
+-                # RS: cada rank fornece sua fatia; preenche com zeros se faltar
+-                chunk = params[base:base + world]
+-                rs_inputs = [p.grad for p in chunk] + [zero_buffer] * max(0, world - len(chunk))
+-                rs_output = params[owner_idx].grad if owner_idx < len(params) else zero_buffer.clone()
+-
+-                # reduce_scatter AVG
+-                dist.reduce_scatter(rs_output, rs_inputs, op=dist.ReduceOp.AVG)
+-
+-                # Owner aplica Muon update
+-                if owner_idx < len(params):
+-                    p = params[owner_idx]
+-                    g = rs_output  # já é a média
+-                    state = self.state.setdefault(p, {})
+-                    if "momentum_buffer" not in state:
+-                        state["momentum_buffer"] = torch.zeros_like(g)
+-                    buf: Tensor = state["momentum_buffer"]
+-                    buf.lerp_(g, 1.0 - group["momentum"])
+-                    g = g.lerp_(buf, group["momentum"]) if group["nesterov"] else buf
+-                    g = zeropower_via_newtonschulz5(g, steps=group["ns_steps"])
+-                    scale = float(max(1.0, p.size(-2) / p.size(-1)) ** 0.5)
+-                    p.add_(g, alpha=-group["lr"] * scale)
+-
+-                # all_gather para replicar params atualizados
+-                ag_in = params[owner_idx] if owner_idx < len(params) else zero_buffer
+-                # prepara saídas (preenche até world)
+-                outs = [torch.empty_like(ag_in) for _ in range(world)]
+-                dist.all_gather(outs, ag_in)
+-
+-                # grava de volta nos parâmetros locais desta janela
+-                for i, out in enumerate(outs):
+-                    idx = base + i
+-                    if idx < len(params):
+-                        params[idx].copy_(out)
++                grad = p.grad.detach()
++
++                # All-reduce to average gradients across all ranks
++                dist.all_reduce(grad, op=dist.ReduceOp.SUM)
++                grad.div_(self.world_size)
++
++                # Apply weight decay
++                if weight_decay != 0:
++                    grad = grad.add(p.data, alpha=weight_decay)
++
++                # Momentum update
++                state = self.state.setdefault(p, {})
++                if "momentum_buffer" not in state:
++                    state["momentum_buffer"] = torch.zeros_like(p.data)
++                buf = state["momentum_buffer"]
++                buf.mul_(momentum).add_(grad, alpha=1 - dampening)
++
++                if nesterov:
++                    update = grad.add(buf, alpha=momentum)
++                else:
++                    update = buf
++
++                # Parameter update
++                p.data.add_(update, alpha=-lr)
+diff --git a/nanochat-master/scripts/base_train.py b/nanochat-master/scripts/base_train.py
+index a0bf167..2d1b0f9 100644
+--- a/nanochat-master/scripts/base_train.py
++++ b/nanochat-master/scripts/base_train.py
+@@ -35,6 +35,7 @@ from nanochat.checkpoint_manager import save_checkpoint
+ from nanochat.loss_eval import evaluate_bpb
+ from nanochat.engine import Engine
+ from scripts.base_eval import evaluate_model
++import torch.distributed as dist
+ print_banner()
+ 
+ # -----------------------------------------------------------------------------
+@@ -68,7 +69,7 @@ eval_tokens = 20*524288 # number of tokens to evaluate val loss on
+ core_metric_every = 2000 # every how many steps to evaluate the core metric (-1 = disable)
+ core_metric_max_per_task = 500 # examples per task in estimating the core metric
+ sample_every = 2000 # every how many steps to sample from the model
+-checkpoint_every = 50 # every how many steps to write a checkpoint (<=0 = disable)
++checkpoint_every = 5 # every how many steps to write a checkpoint (<=0 = disable)
+ # Output
+ model_tag = "" # optionally override the model tag for the output checkpoint directory name
+ # now allow CLI to override the settings via the configurator lol
+@@ -149,9 +150,14 @@ fsdp_state_dict_config = None
+ if use_fsdp:
+     print0("[FSDP] Wrapping model with Fully Sharded Data Parallel.")
+     auto_wrap_policy = partial(size_based_auto_wrap_policy, min_num_params=1_000_000)
+-    fsdp_state_dict_config = FullStateDictConfig(offload_to_cpu=False, rank0_only=True)
++    fsdp_state_dict_config = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
++    # ensure the process uses its local GPU
++    if torch.cuda.is_available():
++        torch.cuda.set_device(ddp_local_rank)
++
+     def _fsdp_param_init_fn(module):
+-        device = torch.device(f"cuda:{torch.cuda.current_device()}")
++        # use ddp_local_rank so parameters are placed on the right device for this process
++        device = torch.device(f"cuda:{ddp_local_rank}") if torch.cuda.is_available() else torch.device("cpu")
+         module.to_empty(device=device)
+         if hasattr(module, "init_weights"):
+             module.init_weights()
+@@ -290,6 +296,166 @@ def get_muon_momentum(it):
+     momentum = (1 - frac) * 0.85 + frac * 0.95
+     return momentum
+ 
++# run this after FSDP wrapping and after any param_init_fn runs, before training starts
++def print_param_samples(model):
++    # try common problematic params
++    names_to_check = ["transformer.wte", "lm_head"]
++    for name, p in model.named_parameters():
++        for target in names_to_check:
++            if target in name:
++                try:
++                    arr = p.detach().cpu().view(-1)
++                    print0(f"[PARAM_SAMP] name={name} shape={tuple(p.shape)} mean={arr.float().mean().item():.6g} min={arr.min().item():.6g} max={arr.max().item():.6g} first10={arr[:10].tolist()}")
++                except Exception as e:
++                    print0(f"[PARAM_SAMP_ERR] name={name} err={e}")
++
++print_param_samples(model)
++torch.cuda.synchronize()
++
++def param_checksum(model):
++    s = 0.0
++    ct = 0
++    for name, p in model.named_parameters():
++        v = p.detach().cpu().view(-1)[:10]
++        s += float(v.sum().item())
++        ct += v.numel()
++        if ct > 100: break
++    return s
++
++print0(f"[CHECKSUM] rank={dist.get_rank()} cs={param_checksum(model)}")
++dist.barrier()
++
++def tensor_stats(t):
++    if not torch.is_tensor(t):
++        return str(type(t))
++    return f"shape={tuple(t.shape)} dtype={t.dtype} min={float(t.min()):.6g} max={float(t.max()):.6g} mean={float(t.float().mean()):.6g} any_nan={torch.isnan(t).any().item()} any_inf={torch.isinf(t).any().item()}"
++
++print0(f"[BATCH] rank={dist.get_rank()} x: {tensor_stats(x)} y: {tensor_stats(y)}")
++
++
++for name, p in model.named_parameters():
++    if "lm_head" in name:
++        print0(f"[LM_HEAD_INFO] name={name} shape={tuple(p.shape)} device={p.device} dtype={p.dtype} mean={float(p.detach().cpu().mean()):.6g} min={float(p.detach().cpu().min()):.6g} max={float(p.detach().cpu().max()):.6g}")
++
++# re-init lm_head and optionally tie to embedding
++with torch.no_grad():
++    for name, p in model.named_parameters():
++        if "lm_head" in name:
++            print0(f"[REINIT] reinitializing {name} on rank {dist.get_rank()}")
++            torch.nn.init.normal_(p, mean=0.0, std=0.02)   # or whatever your init scheme is
++
++# ensure all ranks see the same params: broadcast from rank 0
++for name, p in model.named_parameters():
++    if "lm_head" in name:
++        dist.broadcast(p, src=0)
++dist.barrier()
++print0("[REINIT] broadcast lm_head completed")
++
++
++# debug: rank / device / param checksum
++rank = dist.get_rank()
++local_rank = int(os.environ.get("LOCAL_RANK", -1))
++print0(f"[RANK INFO] rank={rank} local_rank={local_rank} device={torch.cuda.current_device()}")
++# compute a small checksum over a few params (deterministic)
++def param_checksum(model):
++    s = 0.0
++    ct = 0
++    for name, p in model.named_parameters():
++        if p.numel() == 0: continue
++        v = p.detach().cpu().view(-1)[:10]  # first 10 elems
++        s += float(v.sum().item())
++        ct += v.numel()
++        if ct > 100: break
++    return s
++print0(f"[PARAM_CHECKSUM] rank={rank} checksum={param_checksum(model)}")
++torch.cuda.synchronize()
++
++# Print dtype/device for head and embeddings on each rank
++for name, p in model.named_parameters():
++    if "wte" in name or "lm_head" in name:
++        print0(f"[TYPECHK] rank={dist.get_rank()} name={name} shape={tuple(p.shape)} device={p.device} dtype={p.dtype} mean={float(p.detach().cpu().mean()):.6g}")
++
++
++# Run on all ranks; do on rank 0 and broadcast to others to ensure identical state
++if dist.get_rank() == 0:
++    # collect raw parameters from the underlying module if needed
++    # If you wrapped already, get underlying raw model if available:
++    raw = getattr(model, "_fsdp_wrapped_module", model)
++    # init in float32 on CPU
++    with torch.no_grad():
++        for n, p in raw.named_parameters():
++            p_cpu = p.detach().cpu().float()
++            torch.nn.init.normal_(p_cpu, mean=0.0, std=0.02)
++            p.data = p_cpu.to(p.device, dtype=p.dtype)  # keep same dtype/device for now
++dist.barrier()
++# Broadcast params from rank 0 to all.
++for n, p in model.named_parameters():
++    try:
++        dist.broadcast(p, src=0)
++    except Exception as e:
++        print0(f"[BCAST_ERR] {n} err={e}")
++dist.barrier()
++print0("[REINIT] broadcast done")
++
++
++# find embedding and lm_head modules
++emb = None
++lm = None
++for n, m in model.named_modules():
++    if 'wte' in n or 'embed' in n.lower():
++        emb = m
++    if 'lm_head' in n:
++        lm = m
++print0(f"[FIND] emb={emb} lm={lm}")
++
++# run embedding forward and lm_head forward
++with torch.no_grad():
++    try:
++        emb_mod = emb._fsdp_wrapped_module if hasattr(emb, "_fsdp_wrapped_module") else emb
++        lm_mod = lm._fsdp_wrapped_module if hasattr(lm, "_fsdp_wrapped_module") else lm
++        emb_out = emb_mod(x.to(next(emb_mod.parameters()).device))
++        print0(f"[EMB] {tuple(emb_out.shape)} min={float(emb_out.min()):.6g} max={float(emb_out.max()):.6g} any_nan={torch.isnan(emb_out).any().item()}")
++        # create fake logits by projecting emb_out through lm_head (apply as Linear)
++        # flatten and run a small slice to avoid huge memory
++        sample = emb_out.view(-1, emb_out.size(-1))[:16]
++        lm_out = lm_mod(sample.to(next(lm_mod.parameters()).device))
++        print0(f"[LM_APPLY] {tuple(lm_out.shape)} min={float(lm_out.min()):.6g} max={float(lm_out.max()):.6g} any_nan={torch.isnan(lm_out).any().item()}")
++    except Exception as e:
++        print0(f"[SEP_ERR] err={e}")
++
++
++
++nan_found = {"flag": False}
++def forward_hook(module, inp, out):
++    try:
++        if isinstance(out, (tuple, list)):
++            tensors = [o for o in out if torch.is_tensor(o)]
++        elif torch.is_tensor(out):
++            tensors = [out]
++        else:
++            tensors = []
++        for t in tensors:
++            if not torch.isfinite(t).all():
++                #print0(f"[NAN_HIT] rank={dist.get_rank()} module={module.__class__.__name__} name={module} out_stats min={t.min()} max={t.max()}")
++                nan_found["flag"] = True
++    except Exception as e:
++        print0(f"[HOOK_ERR] rank={dist.get_rank()} module={module} err={e}")
++
++hooks = []
++for n, m in model.named_modules():
++    # keep it reasonable: skip tiny modules like LayerNorm wrappers if too noisy?
++    hooks.append(m.register_forward_hook(forward_hook))
++
++# run one forward only (ensure same input used across ranks)
++with autocast_ctx:
++    _ = model(x, y)
++torch.cuda.synchronize()
++for h in hooks:
++    h.remove()
++if nan_found["flag"]:
++    raise RuntimeError("NaN found in forward hooks")
++
++
+ # -----------------------------------------------------------------------------
+ # Training loop
+ val_bpb = resume_meta.get("val_bpb") if resume_meta else None
+@@ -441,26 +607,49 @@ for step in range(start_step, num_iterations + 1):
+     for micro_step in range(grad_accum_steps):
+         with autocast_ctx:
+             loss = model(x, y)
+-        train_loss = loss.detach() # for logging
+-        loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
++
++        def tensor_stats(t):
++            return f"shape={tuple(t.shape)} dtype={t.dtype} min={t.min().item():.6g} max={t.max().item():.6g} mean={t.float().mean().item():.6g}"
++        print0(f"[INPUT] rank={dist.get_rank()} x: {tensor_stats(x)} y: {tensor_stats(y)}")
++
++        # Patch 4: NaN/Inf detection
++        if torch.isnan(loss) or torch.isinf(loss):
++            print0(f"[NaN DETECTED] step={step} micro_step={micro_step} loss={loss.item()}")
++            raise RuntimeError("NaN or Inf in loss")
++    
++        train_loss = loss.detach()  # for logging
++        loss = loss / grad_accum_steps  # each .backward() is a grad sum => normalize loss here
+         loss.backward()
+-        x, y = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
+-    # gradient clipping (TODO possibly expertiment with)
++    
++        # Patch 5: Gradient stats
++        for name, p in model.named_parameters():
++            if p.grad is not None:
++                g = p.grad.detach()
++                #print0(f"[Grad] {name}: mean={g.float().mean().item():.3e}, max={g.float().max().item():.3e}")
++    
++        x, y = next(train_loader)  # prefetch the next batch while the GPU is busy with forward/backward
++    
++    # Patch 6: Gradient clipping diagnostics
+     if grad_clip > 0.0:
+         if use_fsdp:
+-            model.clip_grad_norm_(grad_clip)
++            total_norm = model.clip_grad_norm_(grad_clip)
+         else:
+-            torch.nn.utils.clip_grad_norm_(orig_model.parameters(), grad_clip)
++            total_norm = torch.nn.utils.clip_grad_norm_(orig_model.parameters(), grad_clip)
++        print0(f"[GradClip] step={step} norm={total_norm:.3e}")
++    
+     # step the optimizers
+     lrm = get_lr_multiplier(step)
+     for opt in optimizers:
+         for group in opt.param_groups:
+             group["lr"] = group["initial_lr"] * lrm
++    
+     muon_momentum = get_muon_momentum(step)
+     for group in muon_optimizer.param_groups:
+         group["momentum"] = muon_momentum
++    
+     for opt in optimizers:
+         opt.step()
++    
+     model.zero_grad(set_to_none=True)
+     synchronize()
+     t1 = time.time()
