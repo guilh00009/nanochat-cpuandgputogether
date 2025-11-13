@@ -32,15 +32,6 @@ source .venv/bin/activate
 
 USE_MULTI_GPU=${USE_MULTI_GPU:-1}
 NANOCHAT_NPROC=${NANOCHAT_NPROC:-}
-BEST_DBSZ="${DEVICE_BATCH_SIZE_OVERRIDE:-1}"
-BEST_DEPTH="${DEPTH_OVERRIDE:-92}"
-BEST_SEQLEN="${SEQ_LEN_OVERRIDE:-4096}"
-BASE_MODEL_TAG="d${BEST_DEPTH}"
-BASE_CHECKPOINT_DIR="${NANOCHAT_BASE_DIR}/base_checkpoints/${BASE_MODEL_TAG}"
-RESUMING_BASE=0
-if [ -d "${BASE_CHECKPOINT_DIR}" ] && compgen -G "${BASE_CHECKPOINT_DIR}/model_*.pt" >/dev/null 2>&1; then
-  RESUMING_BASE=1
-fi
 
 detect_nproc() {
   local requested="${NANOCHAT_NPROC}"
@@ -111,22 +102,15 @@ curl -L -o "${NANOCHAT_BASE_DIR}/identity_conversations.jsonl" \
 TOK_MAX_CHARS=2000000000     # 2B chars
 TOK_SHARDS=32
 ALL_SHARDS=800               # like the full run
-
-if [ "${RESUMING_BASE}" -eq 1 ]; then
-  echo "Found existing checkpoints at ${BASE_CHECKPOINT_DIR}; skipping tokenizer/data rebuild."
-else
-  python -m nanochat.dataset -n "${TOK_SHARDS}"
-  python -m nanochat.dataset -n "${ALL_SHARDS}" &
-
-  python -m scripts.tok_train --max_chars="${TOK_MAX_CHARS}"
-  python -m scripts.tok_eval
-fi
-
 # ---------- 5) Fixed training configuration ----------------------------------
 if [ "${HAVE_NVIDIA}" -ne 1 ]; then
   echo "No NVIDIA GPU detected; this script expects a 40GB GPU. Exiting."
   exit 1
 fi
+
+BEST_DBSZ="${DEVICE_BATCH_SIZE_OVERRIDE:-1}"
+BEST_DEPTH="${DEPTH_OVERRIDE:-92}"
+BEST_SEQLEN="${SEQ_LEN_OVERRIDE:-4096}"
 
 # ---------- 6) Global knobs for 40GB -----------------------------------------
 BASE_TOTAL_BATCH=262144     # 256k tokens
