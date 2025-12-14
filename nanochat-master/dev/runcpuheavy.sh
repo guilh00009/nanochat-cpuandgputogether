@@ -17,6 +17,32 @@ if ! command -v uv &>/dev/null; then
 fi
 [ -d ".venv" ] || uv venv
 
+# Detect Hardware to invoke correct uv sync extras
+# Default to cpu preventing cuda bloat unless nvidia is explicitly found
+SYNC_EXTRA="cpu"
+
+if command -v nvidia-smi &>/dev/null && nvidia-smi -L &>/dev/null; then
+  echo "Detected Nvidia GPU via nvidia-smi"
+  SYNC_EXTRA="cuda"
+else
+  # Check for Intel Arc via lspci (Linux/WSL)
+  if command -v lspci &>/dev/null; then
+    if lspci | grep -i "Display controller" | grep -i "Intel" &>/dev/null; then
+       echo "Detected Intel GPU via lspci"
+       SYNC_EXTRA="cpu"
+    fi
+  # Check for Intel Arc via wmic (Windows/Git Bash)
+  elif command -v wmic &>/dev/null; then
+    if wmic path win32_videocontroller get name | grep -i "Intel" | grep -i "Arc" &>/dev/null; then
+       echo "Detected Intel Arc GPU via wmic"
+       SYNC_EXTRA="cpu"
+    fi
+  fi
+fi
+
+echo "Syncing dependencies with extra: ${SYNC_EXTRA}..."
+uv sync --extra "${SYNC_EXTRA}"
+
 HAVE_NVIDIA=0
 if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
   HAVE_NVIDIA=1
