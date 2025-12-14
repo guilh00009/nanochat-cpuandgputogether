@@ -1,7 +1,6 @@
-# Task: Add Intel GPU (XPU) Support to Installation
+# Task: Fix Intel XPU Dependency Resolution
 
 ## Todo List
 - [x] Create implementation plan <!-- id: 0 -->
-- [x] Update `pyproject.toml` to include `xpu` extra and source <!-- id: 1 -->
-- [x] Update `INSTALL.md` with Intel GPU instructions <!-- id: 2 -->
-- [x] Verify changes <!-- id: 3 -->
+- [x] Modify `pyproject.toml` to add `pytorch-triton-xpu` source mapping <!-- id: 1 -->
+- [/] Verify fix with user <!-- id: 2 -->

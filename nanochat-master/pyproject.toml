@@ -51,6 +51,9 @@ torch = [
     { index = "pytorch-cu128", extra = "cuda" },  
     { index = "pytorch-xpu", extra = "xpu" },
 ]
+pytorch-triton-xpu = [
+    { index = "pytorch-xpu", extra = "xpu" },
+]
 
 [[tool.uv.index]]  
 name = "pytorch-cpu"  
