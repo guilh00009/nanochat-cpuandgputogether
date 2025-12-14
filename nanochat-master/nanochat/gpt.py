@@ -85,7 +85,40 @@ class CausalSelfAttention(nn.Module):
 
         # Attention: queries attend to keys/values autoregressively. A few cases to handle:
         enable_gqa = self.n_head != self.n_kv_head # Group Query Attention (GQA): duplicate key/value heads to match query heads if desired
-        if kv_cache is None or Tq == Tk:
+        is_xpu = q.device.type == "xpu"
+
+        if is_xpu:
+            # Manual implementation for XPU to avoid Flash Attention issues
+            if enable_gqa:
+                # Manual GQA: repeat the key/value heads
+                k = k.repeat_interleave(self.n_head // self.n_kv_head, dim=1)
+                v = v.repeat_interleave(self.n_head // self.n_kv_head, dim=1)
+            
+            # Scaled dot product attention
+            # (B, H, Tq, D) @ (B, H, D, Tk) -> (B, H, Tq, Tk)
+            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            
+            if kv_cache is None or Tq == Tk:
+                # Causal mask: mask out future tokens (upper triangle excluding diagonal)
+                mask = torch.triu(torch.ones(Tq, Tk, dtype=torch.bool, device=q.device), diagonal=1)
+                att = att.masked_fill(mask, float('-inf'))
+            elif Tq == 1:
+                # Single query attends to all keys - no masking needed
+                pass
+            else:
+                # Chunked inference with prefix
+                # Construct mask where True = keep, then invert for masked_fill
+                mask = torch.zeros((Tq, Tk), dtype=torch.bool, device=q.device)
+                prefix_len = Tk - Tq
+                if prefix_len > 0:
+                    mask[:, :prefix_len] = True
+                mask[:, prefix_len:] = torch.tril(torch.ones((Tq, Tq), dtype=torch.bool, device=q.device))
+                att = att.masked_fill(~mask, float('-inf'))
+
+            att = F.softmax(att, dim=-1)
+            y = att @ v
+
+        elif kv_cache is None or Tq == Tk:
             # During training (no KV cache), attend as usual with causal attention
             # And even if there is KV cache, we can still use this simple version when Tq == Tk
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=enable_gqa)
