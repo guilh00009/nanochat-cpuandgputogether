@@ -18,7 +18,6 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint as activation_checkpoint_fn
 
 from nanochat.common import get_dist_info, print0
 from nanochat.muon import Muon, DistMuon
@@ -32,7 +31,6 @@ class GPTConfig:
     n_head: int = 6 # number of query heads
     n_kv_head: int = 6 # number of key/value heads (MQA)
     n_embd: int = 768
-    activation_checkpoint: bool = False
 
 
 def norm(x):
@@ -212,17 +210,9 @@ class GPT(nn.Module):
         num_flops_per_token = 6 * (nparams - nparams_embedding) + 12 * l * h * q * t
         return num_flops_per_token
 
-    def setup_optimizers(
-        self,
-        unembedding_lr=0.004,
-        embedding_lr=0.2,
-        matrix_lr=0.02,
-        weight_decay=0.0,
-        use_dist_optimizers=True,
-    ):
+    def setup_optimizers(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0):
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
-        use_dist = ddp and use_dist_optimizers
         # Separate out all parameters into 3 groups (matrix, embedding, lm_head)
         matrix_params = list(self.transformer.h.parameters())
         embedding_params = list(self.transformer.wte.parameters())
@@ -238,11 +228,11 @@ class GPT(nn.Module):
             dict(params=embedding_params, lr=embedding_lr * dmodel_lr_scale),
         ]
         adamw_kwargs = dict(betas=(0.8, 0.95), eps=1e-10, weight_decay=weight_decay)
-        AdamWFactory = DistAdamW if use_dist else partial(torch.optim.AdamW, fused=True)
+        AdamWFactory = DistAdamW if ddp else partial(torch.optim.AdamW, fused=True)
         adamw_optimizer = AdamWFactory(adam_groups, **adamw_kwargs)
         # Create the Muon optimizer for the linear layers
         muon_kwargs = dict(lr=matrix_lr, momentum=0.95)
-        MuonFactory = DistMuon if use_dist else Muon
+        MuonFactory = DistMuon if ddp else Muon
         muon_optimizer = MuonFactory(matrix_params, **muon_kwargs)
         # Combine them the two optimizers into one list
         optimizers = [adamw_optimizer, muon_optimizer]
@@ -265,18 +255,8 @@ class GPT(nn.Module):
         # Forward the trunk of the Transformer
         x = self.transformer.wte(idx)
         x = norm(x)
-        cos, sin = cos_sin
         for block in self.transformer.h:
-            if (
-                self.config.activation_checkpoint
-                and self.training
-                and kv_cache is None
-            ):
-                def block_forward(x_in, cos_in, sin_in, *, blk=block):
-                    return blk(x_in, (cos_in, sin_in), None)
-                x = activation_checkpoint_fn(block_forward, x, cos, sin)
-            else:
-                x = block(x, (cos, sin), kv_cache)
+            x = block(x, cos_sin, kv_cache)
         x = norm(x)
 
         # Forward the lm_head (compute logits)

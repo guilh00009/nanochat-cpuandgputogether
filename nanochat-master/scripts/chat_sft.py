@@ -16,6 +16,7 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import wandb
 import torch
 import torch.distributed as dist
+from functools import partial
 from contextlib import nullcontext
 
 from nanochat.common import compute_init, compute_cleanup, get_base_dir, print0, DummyWandb, autodetect_device_type, maybe_launch_multi_gpu
@@ -69,7 +70,17 @@ device_type = autodetect_device_type() if device_type == "" else device_type
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
 master_process = ddp_rank == 0
 ptdtype = torch.float32 if dtype == 'float32' else torch.bfloat16
+pddtype = torch.float32 if dtype == 'float32' else torch.bfloat16
 autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype) if device_type == "cuda" else nullcontext()
+get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
+
+# FSDP imports and setup
+use_fsdp = ddp and device_type == "cuda"
+if use_fsdp:
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+    from torch.distributed.fsdp import MixedPrecision, CPUOffload
+    from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+    from nanochat.gpt import Block
 
 # wandb logging init
 use_dummy_wandb = run == "dummy" or not master_process
@@ -78,6 +89,29 @@ wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-sf
 # Load the model and tokenizer
 model, tokenizer, meta = load_model(source, device, phase="train", model_tag=model_tag, step=step)
 orig_model = model # original, uncompiled model
+
+# FSDP wrapping
+if use_fsdp:
+    # Basic FSDP config for bfloat16
+    mp_policy = MixedPrecision(
+        param_dtype=torch.bfloat16, 
+        reduce_dtype=torch.bfloat16, 
+        buffer_dtype=torch.bfloat16
+    )
+    # Auto wrap policy for transformer blocks
+    auto_wrap_policy = partial(
+        transformer_auto_wrap_policy,
+        transformer_layer_cls={Block},
+    )
+    
+    model = FSDP(
+        model,
+        auto_wrap_policy=auto_wrap_policy,
+        mixed_precision=mp_policy,
+        device_id=device,
+        use_orig_params=True # Needed for torch.compile and some optimizer logic
+    )
+    print0("FSDP initialized (chat_sft).")
 # model = torch.compile(model, dynamic=True) # doesn't work super well because of variable lengths of inputs
 engine = Engine(model, tokenizer) # will be used for inline model evaluation only
 depth = model.config.n_layer
@@ -199,12 +233,17 @@ build_val_loader = lambda: sft_data_generator(val_ds, batch_size=device_batch_si
 # -----------------------------------------------------------------------------
 # Initialize the Optimizer
 
-optimizers = model.setup_optimizers(
-    unembedding_lr=unembedding_lr,
-    embedding_lr=embedding_lr,
-    matrix_lr=matrix_lr,
-    weight_decay=weight_decay,
-)
+# Initialize the Optimizer
+if use_fsdp:
+    print0("Using FSDP: Fallback to AdamW optimizer.")
+    optimizers = [torch.optim.AdamW(model.parameters(), lr=0.0006, betas=(0.9, 0.95), weight_decay=weight_decay)]
+else:
+    optimizers = model.setup_optimizers(
+        unembedding_lr=unembedding_lr,
+        embedding_lr=embedding_lr,
+        matrix_lr=matrix_lr,
+        weight_decay=weight_decay,
+    )
 # Set the initial learning rate as a fraction of the base learning rate
 for opt in optimizers:
     for group in opt.param_groups:
@@ -220,21 +259,25 @@ if resume_optimizer_states is not None:
     resume_optimizer_states = None
 
 def save_chat_checkpoint(step_to_save):
-    model_state = model.state_dict()
-    optimizer_states = [opt.state_dict() for opt in optimizers] if master_process else None
-    if master_process:
-        save_checkpoint(
-            checkpoint_dir,
-            step_to_save,
-            model_state,
-            optimizer_states,
-            {
-                "step": step_to_save,
-                "val_loss": last_val_loss,
-                **last_metrics,
-                "model_config": dict(model.config.__dict__),
-            }
-        )
+    # For FSDP saving
+    if use_fsdp:
+        with FSDP.state_dict_type(model, torch.distributed.fsdp.StateDictType.FULL_STATE_DICT):
+            model_sd = model.state_dict()
+    else:
+        model_sd = model.state_dict()
+
+    save_checkpoint(
+        checkpoint_dir,
+        step_to_save,
+        model_sd,
+        [opt.state_dict() for opt in optimizers],
+        {
+            "step": step_to_save,
+            "val_loss": last_val_loss,
+            **last_metrics,
+            "model_config": dict(model.config.__dict__),
+        }
+    )
 
 # -----------------------------------------------------------------------------
 # Training loop
@@ -298,8 +341,8 @@ for step in range(start_step, num_iterations):
         })
         model.train()
 
-    if last_step:
-        if master_process and last_checkpoint_step is not None and last_checkpoint_step != step:
+    if master_process and last_step:
+        if last_checkpoint_step is not None and last_checkpoint_step != step:
             delete_checkpoint_files(checkpoint_dir, last_checkpoint_step)
         save_chat_checkpoint(step)
         last_checkpoint_step = step
@@ -342,8 +385,8 @@ for step in range(start_step, num_iterations):
         "num_tokens": num_tokens_item,
     })
 
-    if checkpoint_every > 0 and step > 0 and step % checkpoint_every == 0:
-        if master_process and last_checkpoint_step is not None and last_checkpoint_step != step:
+    if master_process and checkpoint_every > 0 and step > 0 and step % checkpoint_every == 0:
+        if last_checkpoint_step is not None and last_checkpoint_step != step:
             delete_checkpoint_files(checkpoint_dir, last_checkpoint_step)
         save_chat_checkpoint(step)
         last_checkpoint_step = step
@@ -351,12 +394,12 @@ for step in range(start_step, num_iterations):
     step += 1
 
 # Save the model at the end of the run
-if last_checkpoint_step != step:
-    if master_process and last_checkpoint_step is not None and last_checkpoint_step != step:
-        delete_checkpoint_files(checkpoint_dir, last_checkpoint_step)
-    save_chat_checkpoint(step)
-    last_checkpoint_step = step
 if master_process:
+    if last_checkpoint_step != step:
+        if last_checkpoint_step is not None and last_checkpoint_step != step:
+            delete_checkpoint_files(checkpoint_dir, last_checkpoint_step)
+        save_chat_checkpoint(step)
+        last_checkpoint_step = step
     print(f"Saved model checkpoint to {checkpoint_dir}")
 # Log to report
 from nanochat.report import get_report

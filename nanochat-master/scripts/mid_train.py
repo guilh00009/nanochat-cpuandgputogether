@@ -16,6 +16,8 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import time
 import wandb
 import torch
+import torch
+from functools import partial
 from contextlib import nullcontext
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, get_base_dir, autodetect_device_type, maybe_launch_multi_gpu
 from nanochat.tokenizer import get_token_bytes
@@ -64,6 +66,14 @@ autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16)
 synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
 get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
 
+# FSDP imports and setup
+use_fsdp = ddp and device_type == "cuda"
+if use_fsdp:
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+    from torch.distributed.fsdp import MixedPrecision, CPUOffload
+    from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+    from nanochat.gpt import Block
+
 # wandb logging init
 use_dummy_wandb = run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat-mid", name=run, config=user_config)
@@ -74,6 +84,30 @@ pretrain_batch_size = meta.get("device_batch_size", None)
 if pretrain_batch_size is not None and device_batch_size > pretrain_batch_size:
     print0(f"FOOTGUN WARNING: base model training used device_batch_size {pretrain_batch_size}, did you pass in a good --device_batch_size to this script?")
 orig_model = model
+
+# FSDP wrapping
+if use_fsdp:
+    # Basic FSDP config for bfloat16
+    mp_policy = MixedPrecision(
+        param_dtype=torch.bfloat16, 
+        reduce_dtype=torch.bfloat16, 
+        buffer_dtype=torch.bfloat16
+    )
+    # Auto wrap policy for transformer blocks
+    auto_wrap_policy = partial(
+        transformer_auto_wrap_policy,
+        transformer_layer_cls={Block},
+    )
+    
+    model = FSDP(
+        model,
+        auto_wrap_policy=auto_wrap_policy,
+        mixed_precision=mp_policy,
+        device_id=device,
+        use_orig_params=True # Needed for torch.compile and some optimizer logic
+    )
+    print0("FSDP initialized (mid_train).")
+
 model = torch.compile(model, dynamic=False)
 depth = model.config.n_layer
 checkpoint_subdir = f"d{depth}"
@@ -88,8 +122,17 @@ print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {
 token_bytes = get_token_bytes(device=device)
 
 # Initialize the Optimizer (Muon for Linear layers, AdamW for embedding and lm_head)
-optimizers = model.setup_optimizers(unembedding_lr=unembedding_lr, embedding_lr=embedding_lr, matrix_lr=matrix_lr, weight_decay=weight_decay)
-adamw_optimizer, muon_optimizer = optimizers
+# Initialize the Optimizer (Muon for Linear layers, AdamW for embedding and lm_head)
+if use_fsdp:
+    print0("Using FSDP: Fallback to AdamW optimizer (skipping Muon).")
+    optimizers = [torch.optim.AdamW(model.parameters(), lr=0.0006, betas=(0.9, 0.95), weight_decay=weght_decay if 'weght_decay' in locals() else 0.0)]
+    # Fix typo in my thought, assume weight_decay is defined (it is: line 47)
+    optimizers = [torch.optim.AdamW(model.parameters(), lr=0.0006, betas=(0.9, 0.95), weight_decay=weight_decay)]
+    adamw_optimizer = optimizers[0]
+    muon_optimizer = None
+else:
+    optimizers = model.setup_optimizers(unembedding_lr=unembedding_lr, embedding_lr=embedding_lr, matrix_lr=matrix_lr, weight_decay=weight_decay)
+    adamw_optimizer, muon_optimizer = optimizers
 # Override the initial learning rate as a fraction of the base learning rate
 for opt in optimizers:
     for group in opt.param_groups:
@@ -156,30 +199,32 @@ if initial_last_checkpoint_step is not None and os.path.exists(os.path.join(chec
         raise
 
 def save_mid_checkpoint(step_to_save):
-    if dry_run:
-        return
-    model_state = orig_model.state_dict()
-    optimizer_states = [opt.state_dict() for opt in optimizers] if master_process else None
-    if master_process:
-        save_checkpoint(
-            checkpoint_dir,
-            step_to_save,
-            model_state,
-            optimizer_states,
-            {
-                "step": step_to_save,
-                "val_bpb": last_val_bpb,
-                "model_config": {
-                    "sequence_len": max_seq_len,
-                    "vocab_size": tokenizer.get_vocab_size(),
-                    "n_layer": depth,
-                    "n_head": model.config.n_head,
-                    "n_kv_head": model.config.n_kv_head,
-                    "n_embd": model.config.n_embd,
-                },
-                "user_config": user_config,
-            }
-        )
+    # For FSDP saving
+    if use_fsdp:
+        with FSDP.state_dict_type(model, torch.distributed.fsdp.StateDictType.FULL_STATE_DICT):
+            model_sd = model.state_dict()
+    else:
+        model_sd = orig_model.state_dict()
+
+    save_checkpoint(
+        checkpoint_dir,
+        step_to_save,
+        model_sd,
+        [opt.state_dict() for opt in optimizers],
+        {
+            "step": step_to_save,
+            "val_bpb": last_val_bpb,
+            "model_config": {
+                "sequence_len": max_seq_len,
+                "vocab_size": tokenizer.get_vocab_size(),
+                "n_layer": depth,
+                "n_head": model.config.n_head,
+                "n_kv_head": model.config.n_kv_head,
+                "n_embd": model.config.n_embd,
+            },
+            "user_config": user_config,
+        }
+    )
 
 identity_conversations_filepath = os.path.join(base_dir, "identity_conversations.jsonl")
 train_dataset = TaskMixture([
@@ -312,9 +357,10 @@ while True:
     for opt in optimizers:
         for group in opt.param_groups:
             group["lr"] = group["initial_lr"] * lrm
-    muon_momentum = get_muon_momentum(step)
-    for group in muon_optimizer.param_groups:
-        group["momentum"] = muon_momentum
+    if not use_fsdp:
+        muon_momentum = get_muon_momentum(step)
+        for group in muon_optimizer.param_groups:
+            group["momentum"] = muon_momentum
     for opt in optimizers:
         opt.step()
     model.zero_grad(set_to_none=True)
@@ -349,11 +395,11 @@ while True:
             "train/mfu": mfu,
         })
 
-    if not dry_run:
+    if master_process and not dry_run:
         save_due_to_interval = checkpoint_every > 0 and step > 0 and step % checkpoint_every == 0
         save_due_to_last_step = last_step
         if save_due_to_interval or save_due_to_last_step:
-            if master_process and last_checkpoint_step is not None and last_checkpoint_step != step:
+            if last_checkpoint_step is not None and last_checkpoint_step != step:
                 delete_checkpoint_files(checkpoint_dir, last_checkpoint_step)
             save_mid_checkpoint(step)
             last_checkpoint_step = step
@@ -377,6 +423,7 @@ if not dry_run:
         },
         { # stats about training outcomes
             "Minimum validation bpb": min_val_bpb,
+            "Using FSDP": use_fsdp,
         }
     ])
 

@@ -23,59 +23,20 @@ if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
 fi
 
 if [ "${HAVE_NVIDIA}" -eq 1 ]; then
+  NGPUS=$(nvidia-smi -L | wc -l)
+  NGPUS=$(echo "${NGPUS}" | xargs) # trim
+else
+  NGPUS=1
+fi
+echo "Detected ${NGPUS} GPUs."
+
+if [ "${HAVE_NVIDIA}" -eq 1 ]; then
   uv sync --extra cuda
 else
   uv sync --extra cpu
 fi
 
 source .venv/bin/activate
-
-USE_MULTI_GPU=${USE_MULTI_GPU:-1}
-NANOCHAT_NPROC=${NANOCHAT_NPROC:-}
-
-detect_nproc() {
-  local requested="${NANOCHAT_NPROC}"
-  if [ -n "${requested}" ]; then
-    echo "${requested}"
-    return
-  fi
-
-  if ! [[ "${USE_MULTI_GPU}" =~ ^(1|true|TRUE|yes|YES)$ ]]; then
-    echo 1
-    return
-  fi
-
-  local count=0
-  if [ "${HAVE_NVIDIA}" -eq 1 ]; then
-    count=$(nvidia-smi -L | grep -c '^GPU ' || true)
-  fi
-
-  if [ "${count}" -lt 1 ] && command -v python >/dev/null 2>&1; then
-    count=$(python - <<'PY'
-import torch
-try:
-    print(torch.cuda.device_count())
-except Exception:
-    print(0)
-PY
-)
-    count=$(echo "${count}" | tr -d '[:space:]')
-  fi
-
-  if ! [[ "${count}" =~ ^[0-9]+$ ]]; then
-    count=0
-  fi
-
-  if [ "${count}" -lt 1 ]; then
-    count=1
-  fi
-
-  echo "${count}"
-}
-
-NPROC_PER_NODE=$(detect_nproc)
-TORCHRUN=(torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}")
-echo "Using torchrun with ${NPROC_PER_NODE} process(es). Set USE_MULTI_GPU=0 or NANOCHAT_NPROC to override."
 
 : "${WANDB_RUN:=big40}"
 python -m nanochat.report reset
@@ -109,19 +70,69 @@ python -m nanochat.dataset -n "${ALL_SHARDS}" &
 python -m scripts.tok_train --max_chars="${TOK_MAX_CHARS}"
 python -m scripts.tok_eval
 
-# ---------- 5) Fixed training configuration ----------------------------------
+# ---------- 5) Probe for max model (your order, min seq_len=2048) ------------
+# device batch tries: force smallest batch for stability
+CANDIDATE_DEVICE_BATCHES=(1)
+# depth tries: start as high as 3× the original depth 32 and step down
+CANDIDATE_DEPTHS=(52 48 44 40 36 32 30 28 26 24 22 20 18 16 14 12 10 8)
+# seq_len tries: NEVER < 2048
+CANDIDATE_SEQLENS=(2560 2048)
+
+BEST_DBSZ=""
+BEST_DEPTH=""
+BEST_SEQLEN=""
+
+try_probe () {
+  local db="$1"
+  local depth="$2"
+  local seqlen="$3"
+  torchrun --standalone --nproc_per_node="${NGPUS}" -m scripts.base_train \
+    --depth="${depth}" \
+    --max_seq_len="${seqlen}" \
+    --device_batch_size="${db}" \
+    --total_batch_size=32768 \
+    --num_iterations=2 \
+    --eval_every=999999 \
+    --sample_every=999999 \
+    --core_metric_every=999999 \
+    --eval_tokens=2048 \
+    >/dev/null 2>&1
+}
+
+echo "=== Probing maximum depth/seq-len/dbsz that fit memory (40GB) ==="
 if [ "${HAVE_NVIDIA}" -ne 1 ]; then
   echo "No NVIDIA GPU detected; this script expects a 40GB GPU. Exiting."
   exit 1
 fi
 
-BEST_DBSZ="${DEVICE_BATCH_SIZE_OVERRIDE:-1}"
-BEST_DEPTH="${DEPTH_OVERRIDE:-92}"
-BEST_SEQLEN="${SEQ_LEN_OVERRIDE:-4096}"
+for db in "${CANDIDATE_DEVICE_BATCHES[@]}"; do
+  for depth in "${CANDIDATE_DEPTHS[@]}"; do
+    for seqlen in "${CANDIDATE_SEQLENS[@]}"; do
+      echo "Probe dbsz=${db} depth=${depth} seq_len=${seqlen} [GPUs=${NGPUS}] ..."
+      if try_probe "${db}" "${depth}" "${seqlen}"; then
+        BEST_DBSZ="${db}"
+        BEST_DEPTH="${depth}"
+        BEST_SEQLEN="${seqlen}"
+        echo "  -> OK"
+        break 2
+      else
+        echo "  -> OOM / fail"
+      fi
+    done
+  done
+  [ -n "${BEST_DEPTH}" ] && break
+done
+
+# If we STILL don't have a model here, it means even depth=8 at seq_len=2048 didn't fit.
+if [ -z "${BEST_DEPTH}" ]; then
+  echo "FATAL: could not fit even depth=8 at seq_len=2048 on this GPU."
+  echo "You asked to never go below 2048, so we won't auto-lower it."
+  exit 1
+fi
 
 # ---------- 6) Global knobs for 40GB -----------------------------------------
 BASE_TOTAL_BATCH=262144     # 256k tokens
-EVAL_EVERY=25
+EVAL_EVERY=250
 EVAL_TOKENS=4096
 BASE_ITERS=8000             # long run; adjust if needed
 
@@ -132,10 +143,11 @@ echo "SEQ_LEN:        ${BEST_SEQLEN}"
 echo "DEVICE_BATCH:   ${BEST_DBSZ}"
 echo "BASE_TOTAL:     ${BASE_TOTAL_BATCH}"
 echo "BASE_ITERS:     ${BASE_ITERS}"
+echo "NGPUS:          ${NGPUS}"
 echo "====================================================="
 
 # ---------- 7) Base training --------------------------------------------------
-"${TORCHRUN[@]}" -m scripts.base_train \
+torchrun --standalone --nproc_per_node="${NGPUS}" -m scripts.base_train \
   --depth="${BEST_DEPTH}" \
   --max_seq_len="${BEST_SEQLEN}" \
   --device_batch_size="${BEST_DBSZ}" \
@@ -148,8 +160,8 @@ echo "====================================================="
   --num_iterations="${BASE_ITERS}"
 
 # ---------- 8) base_loss / base_eval -----------------------------------------
-"${TORCHRUN[@]}" -m scripts.base_loss -- --device_batch_size="${BEST_DBSZ}" --split_tokens="${EVAL_TOKENS}"
-"${TORCHRUN[@]}" -m scripts.base_eval -- --max-per-task=32
+torchrun --standalone --nproc_per_node="${NGPUS}" -m scripts.base_loss -- --device_batch_size="${BEST_DBSZ}" --split_tokens="${EVAL_TOKENS}"
+torchrun --standalone --nproc_per_node="${NGPUS}" -m scripts.base_eval -- --max-per-task=32
 
 # ======================================================================
 # FROM HERE ON: repo-native mid/SFT (your working style)
@@ -157,19 +169,19 @@ echo "====================================================="
 
 # 9) MID-TRAIN
 echo "==> mid-train (repo-native args only)"
-"${TORCHRUN[@]}" -m scripts.mid_train -- --device_batch_size=${BEST_DBSZ}
+torchrun --standalone --nproc_per_node="${NGPUS}" -m scripts.mid_train -- --device_batch_size=${BEST_DBSZ}
 
 # 10) EVAL (mid)
 echo "==> eval (mid)"
-"${TORCHRUN[@]}" -m scripts.chat_eval -- -i mid
+torchrun --standalone --nproc_per_node="${NGPUS}" -m scripts.chat_eval -- -i mid
 
 # 11) SFT
 echo "==> sft (same device_batch_size)"
-"${TORCHRUN[@]}" -m scripts.chat_sft -- --device_batch_size=${BEST_DBSZ}
+torchrun --standalone --nproc_per_node="${NGPUS}" -m scripts.chat_sft -- --device_batch_size=${BEST_DBSZ}
 
 # 12) EVAL (sft)
 echo "==> eval (sft)"
-"${TORCHRUN[@]}" -m scripts.chat_eval -- -i sft
+torchrun --standalone --nproc_per_node="${NGPUS}" -m scripts.chat_eval -- -i sft
 
 # 13) report
 echo "==> report"
