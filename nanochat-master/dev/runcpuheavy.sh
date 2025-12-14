@@ -36,6 +36,8 @@ if python -c "import torch; assert torch.xpu.is_available()" >/dev/null 2>&1; th
 else
   echo "DEBUG: XPU check failed. Torch version: $(python -c 'import torch; print(torch.__version__)')"
   echo "DEBUG: torch.xpu available? $(python -c 'import torch; print(getattr(torch, "xpu", "module_not_found"))')"
+  echo "DEBUG: Listing torch modules..."
+  python -c "import torch; print(dir(torch))" | grep xpu || true
 fi
 
 if [ "${HAVE_NVIDIA}" -eq 1 ]; then
@@ -279,6 +281,8 @@ if [ "${HAVE_NVIDIA}" -eq 1 ]; then
     GPU_INFO=$(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | head -n 1)
 elif [ "${HAVE_XPU}" -eq 1 ]; then
     GPU_INFO=$(python -c "import torch; print(f'{torch.xpu.get_device_name(0)}, {int(torch.xpu.get_device_properties(0).total_memory/1024/1024)} MiB')")
+else
+    GPU_INFO="CPU Mode"
 fi
 echo "GPU info:       ${GPU_INFO} x ${NGPUS}"
 echo "DEPTH:          ${BEST_DEPTH}"
