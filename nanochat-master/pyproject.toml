@@ -52,7 +52,7 @@ torch = [
     { index = "pytorch-xpu", extra = "xpu" },
 ]
 pytorch-triton-xpu = [
-    { index = "pytorch-xpu", extra = "xpu" },
+    { index = "pytorch-xpu" },
 ]
 
 [[tool.uv.index]]  
