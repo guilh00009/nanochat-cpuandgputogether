@@ -40,9 +40,6 @@ else
   fi
 fi
 
-echo "Syncing dependencies with extra: ${SYNC_EXTRA}..."
-uv sync --extra "${SYNC_EXTRA}"
-
 HAVE_NVIDIA=0
 if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
   HAVE_NVIDIA=1
