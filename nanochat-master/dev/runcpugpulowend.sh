@@ -24,6 +24,9 @@ fi
 HAVE_XPU=0
 if python -c "import torch; assert torch.xpu.is_available()" >/dev/null 2>&1; then
   HAVE_XPU=1
+else
+  echo "DEBUG: XPU check failed. Torch version: $(python -c 'import torch; print(torch.__version__)')"
+  echo "DEBUG: torch.xpu available? $(python -c 'import torch; print(getattr(torch, "xpu", "module_not_found"))')"
 fi
 
 if [ "${HAVE_NVIDIA}" -eq 1 ]; then
@@ -36,11 +39,7 @@ else
 fi
 echo "Detected ${NGPUS} GPUs."
 
-if [ "${HAVE_NVIDIA}" -eq 1 ]; then
-  uv sync --extra cuda
-else
-  uv sync --extra cpu
-fi
+uv pip install -r requirements.txt
 
 source .venv/bin/activate
 

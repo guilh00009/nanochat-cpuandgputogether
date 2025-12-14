@@ -1,0 +1,17 @@
+--extra-index-url https://download.pytorch.org/whl/xpu
+torch
+torchvision
+torchaudio
+datasets>=4.0.0
+fastapi>=0.117.1
+files-to-prompt>=0.6
+numpy==2.3.5
+psutil>=7.1.0
+regex>=2025.9.1
+setuptools>=80.9.0
+tiktoken>=0.11.0
+tokenizers>=0.22.0
+uvicorn>=0.36.0
+wandb>=0.21.3
+maturin>=1.9.4
+pytest>=8.0.0
