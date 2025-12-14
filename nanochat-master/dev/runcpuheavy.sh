@@ -17,12 +17,27 @@ if ! command -v uv &>/dev/null; then
 fi
 [ -d ".venv" ] || uv venv
 
-if [ "${HAVE_NVIDIA}" -eq 1 ]; then
-  # uv sync --extra cuda
-  uv pip install -r requirements.txt
+# Detect Hardware to invoke correct uv sync extras
+# Default to cpu preventing cuda bloat unless nvidia is explicitly found
+SYNC_EXTRA="cpu"
+
+if command -v nvidia-smi &>/dev/null && nvidia-smi -L &>/dev/null; then
+  echo "Detected Nvidia GPU via nvidia-smi"
+  SYNC_EXTRA="cuda"
 else
-  # uv sync --extra cpu
-  uv pip install -r requirements.txt
+  # Check for Intel Arc via lspci (Linux/WSL)
+  if command -v lspci &>/dev/null; then
+    if lspci | grep -i "Display controller" | grep -i "Intel" &>/dev/null; then
+       echo "Detected Intel GPU via lspci"
+       SYNC_EXTRA="cpu"
+    fi
+  # Check for Intel Arc via wmic (Windows/Git Bash)
+  elif command -v wmic &>/dev/null; then
+    if wmic path win32_videocontroller get name | grep -i "Intel" | grep -i "Arc" &>/dev/null; then
+       echo "Detected Intel Arc GPU via wmic"
+       SYNC_EXTRA="cpu"
+    fi
+  fi
 fi
 
 HAVE_NVIDIA=0
@@ -33,9 +48,6 @@ fi
 HAVE_XPU=0
 if python -c "import torch; assert torch.xpu.is_available()" >/dev/null 2>&1; then
   HAVE_XPU=1
-else
-  echo "DEBUG: XPU check failed. Torch version: $(python -c 'import torch; print(torch.__version__)')"
-  echo "DEBUG: torch.xpu available? $(python -c 'import torch; print(getattr(torch, "xpu", "module_not_found"))')"
 fi
 
 if [ "${HAVE_NVIDIA}" -eq 1 ]; then
