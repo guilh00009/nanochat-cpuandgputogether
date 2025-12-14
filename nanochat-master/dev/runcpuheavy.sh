@@ -46,7 +46,7 @@ if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
 fi
 
 HAVE_XPU=0
-if python -c "import torch; import intel_extension_for_pytorch; assert torch.xpu.is_available()" >/dev/null 2>&1; then
+if python -c "import torch; assert torch.xpu.is_available()" >/dev/null 2>&1; then
   HAVE_XPU=1
 fi
 
@@ -54,7 +54,7 @@ if [ "${HAVE_NVIDIA}" -eq 1 ]; then
   NGPUS=$(nvidia-smi -L | wc -l)
   NGPUS=$(echo "${NGPUS}" | xargs) # trim
 elif [ "${HAVE_XPU}" -eq 1 ]; then
-  NGPUS=$(python -c "import torch; import intel_extension_for_pytorch; print(torch.xpu.device_count())")
+  NGPUS=$(python -c "import torch; print(torch.xpu.device_count())")
 else
   NGPUS=1
   # Assuming CPU, but script below might fail if it strictly expects GPU for probing
@@ -191,7 +191,7 @@ if [ -z "${BEST_DEPTH}" ]; then
         if [ "${HAVE_NVIDIA}" -eq 1 ]; then
           GPU_VRAM_MIB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -n 1)
         elif [ "${HAVE_XPU}" -eq 1 ]; then
-          GPU_VRAM_MIB=$(python -c "import torch; import intel_extension_for_pytorch; print(int(torch.xpu.get_device_properties(0).total_memory / 1024 / 1024))")
+          GPU_VRAM_MIB=$(python -c "import torch; print(int(torch.xpu.get_device_properties(0).total_memory / 1024 / 1024))")
         fi
         echo "Detected VRAM per GPU: ${GPU_VRAM_MIB} MiB"
         
@@ -290,7 +290,7 @@ echo "=== FINAL CONFIG (Auto-Detected) ==="
 if [ "${HAVE_NVIDIA}" -eq 1 ]; then
     GPU_INFO=$(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | head -n 1)
 elif [ "${HAVE_XPU}" -eq 1 ]; then
-    GPU_INFO=$(python -c "import torch; import intel_extension_for_pytorch; print(f'{torch.xpu.get_device_name(0)}, {int(torch.xpu.get_device_properties(0).total_memory/1024/1024)} MiB')")
+    GPU_INFO=$(python -c "import torch; print(f'{torch.xpu.get_device_name(0)}, {int(torch.xpu.get_device_properties(0).total_memory/1024/1024)} MiB')")
 fi
 echo "GPU info:       ${GPU_INFO} x ${NGPUS}"
 echo "DEPTH:          ${BEST_DEPTH}"
