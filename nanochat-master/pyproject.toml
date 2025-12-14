@@ -48,7 +48,11 @@ python_functions = ["test_*"]
 [tool.uv.sources]
 torch = [  
     { index = "pytorch-cpu", extra = "cpu" },  
-    { index = "pytorch-cu128", extra = "cuda" }
+    { index = "pytorch-cu128", extra = "cuda" },  
+    { index = "pytorch-xpu", extra = "xpu" },
+]
+pytorch-triton-xpu = [
+    { index = "pytorch-nightly" },
 ]
 
 [[tool.uv.index]]  
@@ -60,6 +64,11 @@ explicit = true
 name = "pytorch-cu128"  
 url = "https://download.pytorch.org/whl/cu128"  
     explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-xpu"
+url = "https://download.pytorch.org/whl/xpu"
+explicit = true
 
 [[tool.uv.index]]
 name = "pytorch-nightly"
@@ -74,11 +83,15 @@ cpu = [
 cuda = [  
     "torch>=2.8.0",  
 ]  
-
+xpu = [
+    "torch>=2.8.0",
+]
+  
 [tool.uv]  
 conflicts = [  
     [  
         { extra = "cpu" },  
-        { extra = "cuda" }
+        { extra = "cuda" },  
+        { extra = "xpu" },
     ],  
 ]
