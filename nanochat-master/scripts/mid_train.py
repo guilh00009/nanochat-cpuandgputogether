@@ -188,7 +188,11 @@ if initial_last_checkpoint_step is not None and os.path.exists(os.path.join(chec
             optimizer_states = torch.load(optim_path, map_location=device)
             if isinstance(optimizer_states, (list, tuple)):
                 for opt, opt_state in zip(optimizers, optimizer_states):
-                    opt.load_state_dict(opt_state)
+                    if use_fsdp:
+                        sharded_opt_state = FSDP.shard_full_optim_state_dict(opt_state, model)
+                        opt.load_state_dict(sharded_opt_state)
+                    else:
+                        opt.load_state_dict(opt_state)
         if os.path.exists(meta_path):
             with open(meta_path, "r") as f:
                 resume_meta = json.load(f)
@@ -203,14 +207,19 @@ def save_mid_checkpoint(step_to_save):
     if use_fsdp:
         with FSDP.state_dict_type(model, torch.distributed.fsdp.StateDictType.FULL_STATE_DICT):
             model_sd = model.state_dict()
+            # FSDP optimizer saving
+            optimizer_states = []
+            for opt in optimizers:
+                optimizer_states.append(FSDP.full_optim_state_dict(model, opt))
     else:
         model_sd = orig_model.state_dict()
+        optimizer_states = [opt.state_dict() for opt in optimizers]
 
     save_checkpoint(
         checkpoint_dir,
         step_to_save,
         model_sd,
-        [opt.state_dict() for opt in optimizers],
+        optimizer_states,
         {
             "step": step_to_save,
             "val_bpb": last_val_bpb,

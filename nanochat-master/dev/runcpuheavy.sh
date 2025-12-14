@@ -70,13 +70,48 @@ python -m nanochat.dataset -n "${ALL_SHARDS}" &
 python -m scripts.tok_train --max_chars="${TOK_MAX_CHARS}"
 python -m scripts.tok_eval
 
-# ---------- 5) Probe for max model (your order, min seq_len=2048) ------------
-# device batch tries: force smallest batch for stability
-CANDIDATE_DEVICE_BATCHES=(1)
-# depth tries: start as high as 3× the original depth 32 and step down
-CANDIDATE_DEPTHS=(52 48 44 40 36 32 30 28 26 24 22 20 18 16 14 12 10 8)
-# seq_len tries: NEVER < 2048
-CANDIDATE_SEQLENS=(2560 2048)
+# ---------- 5) Probe for max model (Dynamic Resource Detection) ---------------- #
+# We want to find the MAX DEPTH that fits in memory, with at least seq_len=2048.
+# Priority: Depth (Model Size) > SeqLen > Batch Size.
+
+echo "=== Probing maximum depth/seq-len/dbsz based on available VRAM ==="
+
+if [ "${HAVE_NVIDIA}" -ne 1 ]; then
+  echo "No NVIDIA GPU detected. This script implementation requires NVIDIA GPUs."
+  exit 1
+fi
+
+# Detect VRAM of the first GPU (assuming homogeneous cluster for now)
+# Unit: MiB
+GPU_VRAM_MIB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -n 1)
+echo "Detected VRAM per GPU: ${GPU_VRAM_MIB} MiB"
+
+# Define Candidate Lists based on VRAM Scale
+# If > 70GB (e.g. A100/H100 80GB), try deeper models.
+# If > 35GB (e.g. A100 40GB/A6000), standard range.
+# If > 20GB (e.g. 3090/4090), lower range.
+# Else (consumer small), minimal range.
+
+if [ "$GPU_VRAM_MIB" -gt 70000 ]; then
+    # ~80GB: Can probably go significantly deeper or larger batch
+    CANDIDATE_DEPTHS=(80 72 64 60 56 52 48 44 40)
+    CANDIDATE_DEVICE_BATCHES=(16 8 4 2 1)
+elif [ "$GPU_VRAM_MIB" -gt 35000 ]; then
+    # ~40GB-48GB
+    CANDIDATE_DEPTHS=(52 48 44 40 36 32 28 24)
+    CANDIDATE_DEVICE_BATCHES=(8 4 2 1)
+elif [ "$GPU_VRAM_MIB" -gt 20000 ]; then
+    # ~24GB
+    CANDIDATE_DEPTHS=(32 28 24 20 16 12)
+    CANDIDATE_DEVICE_BATCHES=(4 2 1)
+else
+    # ~16GB or less
+    CANDIDATE_DEPTHS=(24 20 16 12 8)
+    CANDIDATE_DEVICE_BATCHES=(2 1)
+fi
+
+# Ideally we want larger SeqLen, but 2048 is the hard floor.
+CANDIDATE_SEQLENS=(4096 2048)
 
 BEST_DBSZ=""
 BEST_DEPTH=""
@@ -86,6 +121,17 @@ try_probe () {
   local db="$1"
   local depth="$2"
   local seqlen="$3"
+  
+  # For very small depths, increase batch size minimum to avoid inefficient training
+  if [ "$depth" -le 16 ] && [ "$db" -eq 1 ]; then
+      # Optional optimization: Skip batch=1 for small models unless strictly necessary?
+      # For now, we keep it to ensure *something* runs.
+      :
+  fi
+  
+  echo "  ... trying dbsz=${db} depth=${depth} seq_len=${seqlen} in subprocess ..."
+  
+  # Run a quick probe: 2 iterations
   torchrun --standalone --nproc_per_node="${NGPUS}" -m scripts.base_train \
     --depth="${depth}" \
     --max_seq_len="${seqlen}" \
@@ -99,51 +145,61 @@ try_probe () {
     >/dev/null 2>&1
 }
 
-echo "=== Probing maximum depth/seq-len/dbsz that fit memory (40GB) ==="
-if [ "${HAVE_NVIDIA}" -ne 1 ]; then
-  echo "No NVIDIA GPU detected; this script expects a 40GB GPU. Exiting."
-  exit 1
-fi
+# PROBING LOOP:
+# We iterate Dept (High->Low) -> SeqLen (High->Low) -> Batch (High->Low)
+# The first one that succeeds is our winner.
 
-for db in "${CANDIDATE_DEVICE_BATCHES[@]}"; do
-  for depth in "${CANDIDATE_DEPTHS[@]}"; do
-    for seqlen in "${CANDIDATE_SEQLENS[@]}"; do
-      echo "Probe dbsz=${db} depth=${depth} seq_len=${seqlen} [GPUs=${NGPUS}] ..."
+found=0
+for depth in "${CANDIDATE_DEPTHS[@]}"; do
+  for seqlen in "${CANDIDATE_SEQLENS[@]}"; do
+    for db in "${CANDIDATE_DEVICE_BATCHES[@]}"; do
+      echo "Probe: Depth=${depth} | SeqLen=${seqlen} | Batch=${db} [GPUs=${NGPUS}]"
+      
       if try_probe "${db}" "${depth}" "${seqlen}"; then
-        BEST_DBSZ="${db}"
         BEST_DEPTH="${depth}"
         BEST_SEQLEN="${seqlen}"
-        echo "  -> OK"
-        break 2
+        BEST_DBSZ="${db}"
+        found=1
+        echo "  -> SUCCESS! Found max fit."
+        break 3
       else
-        echo "  -> OOM / fail"
+        echo "  -> OOM or Fail."
       fi
     done
   done
-  [ -n "${BEST_DEPTH}" ] && break
 done
 
-# If we STILL don't have a model here, it means even depth=8 at seq_len=2048 didn't fit.
-if [ -z "${BEST_DEPTH}" ]; then
-  echo "FATAL: could not fit even depth=8 at seq_len=2048 on this GPU."
-  echo "You asked to never go below 2048, so we won't auto-lower it."
-  exit 1
+if [ "${found}" -eq 0 ]; then
+  # Fallback to absolute minimums if specific probe list failed, essentially a Hail Mary
+  echo "WARN: Standard probes failed. Trying safety fallback (Depth=8, SeqLen=2048, Batch=1)..."
+  if try_probe "1" "8" "2048"; then
+      BEST_DEPTH=8
+      BEST_SEQLEN=2048
+      BEST_DBSZ=1
+      echo "  -> Safety fallback passed."
+  else
+      echo "FATAL: Could not fit even the smallest model (Depth=8)."
+      exit 1
+  fi
 fi
 
-# ---------- 6) Global knobs for 40GB -----------------------------------------
+# ---------- 6) Global knobs optimized for detected settings ------------------
+# Adjust Total Batch Size based on scale? For now keep fixed large batch for stability.
 BASE_TOTAL_BATCH=262144     # 256k tokens
 EVAL_EVERY=250
+# If we have a huge context, we might want to eval more tokens, but 4096 is standard.
 EVAL_TOKENS=4096
-BASE_ITERS=8000             # long run; adjust if needed
+# Adjust iterations? If model is huge, maybe fewer steps? 
+# Current logic: fixed iters.
+BASE_ITERS=8000
 
-echo "=== FINAL CONFIG (40GB, seq_len >= 2048) ==="
-nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
+echo "=== FINAL CONFIG (Auto-Detected) ==="
+echo "GPU info:       $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | head -n 1) x ${NGPUS}"
 echo "DEPTH:          ${BEST_DEPTH}"
 echo "SEQ_LEN:        ${BEST_SEQLEN}"
 echo "DEVICE_BATCH:   ${BEST_DBSZ}"
 echo "BASE_TOTAL:     ${BASE_TOTAL_BATCH}"
 echo "BASE_ITERS:     ${BASE_ITERS}"
-echo "NGPUS:          ${NGPUS}"
 echo "====================================================="
 
 # ---------- 7) Base training --------------------------------------------------

@@ -253,7 +253,11 @@ for opt in optimizers:
 if resume_optimizer_states is not None:
     if isinstance(resume_optimizer_states, (list, tuple)):
         for opt, opt_state in zip(optimizers, resume_optimizer_states):
-            opt.load_state_dict(opt_state)
+            if use_fsdp:
+                sharded_opt_state = FSDP.shard_full_optim_state_dict(opt_state, model)
+                opt.load_state_dict(sharded_opt_state)
+            else:
+                opt.load_state_dict(opt_state)
     else:
         print0("Warning: optimizer checkpoint format unrecognized; skipping optimizer state load")
     resume_optimizer_states = None
@@ -263,14 +267,19 @@ def save_chat_checkpoint(step_to_save):
     if use_fsdp:
         with FSDP.state_dict_type(model, torch.distributed.fsdp.StateDictType.FULL_STATE_DICT):
             model_sd = model.state_dict()
+            # FSDP optimizer saving
+            optimizer_states = []
+            for opt in optimizers:
+                optimizer_states.append(FSDP.full_optim_state_dict(model, opt))
     else:
         model_sd = model.state_dict()
+        optimizer_states = [opt.state_dict() for opt in optimizers]
 
     save_checkpoint(
         checkpoint_dir,
         step_to_save,
         model_sd,
-        [opt.state_dict() for opt in optimizers],
+        optimizer_states,
         {
             "step": step_to_save,
             "val_loss": last_val_loss,
