@@ -71,7 +71,6 @@ if ! command -v cargo >/dev/null 2>&1; then
 fi
 # shellcheck source=/dev/null
 source "${HOME}/.cargo/env"
-uv run maturin develop --release --manifest-path rustbpe/Cargo.toml
 
 # ---------- 3) Eval bundle + identity ----------------------------------------
 EVAL_BUNDLE_URL="https://karpathy-public.s3.us-west-2.amazonaws.com/eval_bundle.zip"
