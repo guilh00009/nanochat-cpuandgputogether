@@ -71,11 +71,16 @@ ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type
 master_process = ddp_rank == 0
 ptdtype = torch.float32 if dtype == 'float32' else torch.bfloat16
 pddtype = torch.float32 if dtype == 'float32' else torch.bfloat16
-autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype) if device_type == "cuda" else nullcontext()
-get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
+autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype) if device_type in ("cuda", "xpu") else nullcontext()
+if device_type == "cuda":
+    get_max_memory = torch.cuda.max_memory_allocated
+elif device_type == "xpu":
+    get_max_memory = torch.xpu.max_memory_allocated
+else:
+    get_max_memory = lambda: 0
 
 # FSDP imports and setup
-use_fsdp = ddp and device_type == "cuda"
+use_fsdp = ddp and device_type in ("cuda", "xpu")
 if use_fsdp:
     from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
     from torch.distributed.fsdp import MixedPrecision, CPUOffload

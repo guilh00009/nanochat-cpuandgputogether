@@ -19,11 +19,12 @@ torchrun --standalone --nproc_per_node=8 -m scripts.chat_rl -- --run=default
 import os
 import itertools
 import re
+from contextlib import nullcontext
 import wandb
 import torch
 import torch.distributed as dist
 
-from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, DummyWandb, maybe_launch_multi_gpu
+from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, DummyWandb, maybe_launch_multi_gpu, autodetect_device_type
 from nanochat.checkpoint_manager import save_checkpoint, load_model
 from nanochat.engine import Engine
 from tasks.gsm8k import GSM8K
@@ -54,11 +55,12 @@ user_config = {k: globals()[k] for k in config_keys} # will be useful for loggin
 # -----------------------------------------------------------------------------
 
 # Init compute/precision
-maybe_launch_multi_gpu()
-ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init()
+device_type = autodetect_device_type()
+maybe_launch_multi_gpu(device_type)
+ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
 master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
 dtype = torch.float32 if dtype == 'float32' else torch.bfloat16
-autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=dtype)
+autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=dtype) if device_type in ("cuda", "xpu") else nullcontext()
 
 # wandb logging init
 use_dummy_wandb = run == "dummy" or not master_process

@@ -167,7 +167,7 @@ class GPT(nn.Module):
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.cos, self.sin = cos, sin
         # Cast the embeddings from fp32 to bf16: optim can tolerate it and it saves memory: both in the model and the activations
-        if self.transformer.wte.weight.device.type == "cuda":
+        if self.transformer.wte.weight.device.type in ("cuda", "xpu"):
             self.transformer.wte.to(dtype=torch.bfloat16)
 
     def _init_weights(self, module):

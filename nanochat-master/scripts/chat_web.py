@@ -70,7 +70,7 @@ parser.add_argument('-g', '--model-tag', type=str, default=None, help='Model tag
 parser.add_argument('-s', '--step', type=int, default=None, help='Step to load')
 parser.add_argument('-p', '--port', type=int, default=8000, help='Port to run the server on')
 parser.add_argument('-d', '--dtype', type=str, default='bfloat16', choices=['float32', 'bfloat16'])
-parser.add_argument('--device-type', type=str, default='', choices=['cuda', 'cpu', 'mps'], help='Device type for evaluation: cuda|cpu|mps. empty => autodetect')
+parser.add_argument('--device-type', type=str, default='', choices=['cuda', 'cpu', 'mps', 'xpu'], help='Device type for evaluation: cuda|cpu|mps|xpu. empty => autodetect')
 parser.add_argument('--host', type=str, default='0.0.0.0', help='Host to bind the server to')
 args = parser.parse_args()
 
@@ -102,6 +102,8 @@ class WorkerPool:
         if num_gpus is None:
             if device_type == "cuda":
                 num_gpus = torch.cuda.device_count()
+            elif device_type == "xpu":
+                num_gpus = torch.xpu.device_count()
             else:
                 num_gpus = 1 # e.g. cpu|mps
         self.num_gpus = num_gpus
@@ -112,20 +114,23 @@ class WorkerPool:
         """Load model on each GPU."""
         print(f"Initializing worker pool with {self.num_gpus} GPUs...")
         if self.num_gpus > 1:
-            assert device_type == "cuda", "Only CUDA supports multiple workers/GPUs. cpu|mps does not."
+            assert device_type in ("cuda", "xpu"), "Only CUDA/XPU supports multiple workers/GPUs. cpu|mps does not."
 
         for gpu_id in range(self.num_gpus):
 
             if device_type == "cuda":
                 device = torch.device(f"cuda:{gpu_id}")
                 print(f"Loading model on GPU {gpu_id}...")
+            elif device_type == "xpu":
+                device = torch.device(f"xpu:{gpu_id}")
+                print(f"Loading model on XPU {gpu_id}...")
             else:
                 device = torch.device(device_type) # e.g. cpu|mps
                 print(f"Loading model on {device_type}...")
 
             model, tokenizer, _ = load_model(source, device, phase="eval", model_tag=model_tag, step=step)
             engine = Engine(model, tokenizer)
-            autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype) if device_type == "cuda" else nullcontext()
+            autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=ptdtype) if device_type in ("cuda", "xpu") else nullcontext()
 
             worker = Worker(
                 gpu_id=gpu_id,

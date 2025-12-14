@@ -12,6 +12,11 @@ import urllib.request
 import torch
 import torch.distributed as dist
 
+try:
+    import intel_extension_for_pytorch as ipex
+except ImportError:
+    pass
+
 class ColoredFormatter(logging.Formatter):
     """Custom formatter that adds colors to log messages."""
     # ANSI color codes
@@ -132,9 +137,11 @@ def get_dist_info():
         return False, 0, 0, 1
 
 def autodetect_device_type():
-    # prefer to use CUDA if available, otherwise use MPS, otherwise fallback on CPU
+    # prefer to use CUDA if available, otherwise XPU, otherwise MPS, otherwise fallback on CPU
     if torch.cuda.is_available():
         device_type = "cuda"
+    elif hasattr(torch, "xpu") and torch.xpu.is_available():
+        device_type = "xpu"
     elif torch.backends.mps.is_available():
         device_type = "mps"
     else:
@@ -158,19 +165,28 @@ def maybe_launch_multi_gpu(preferred_device_type=""):
     if preferred_device_type in (None, "", "auto"):
         if torch.cuda.is_available():
             device_type = "cuda"
+        elif hasattr(torch, "xpu") and torch.xpu.is_available():
+            device_type = "xpu"
         elif torch.backends.mps.is_available():
             device_type = "mps"
         else:
             device_type = "cpu"
     else:
         device_type = preferred_device_type
-    if device_type != "cuda":
+
+    if device_type not in ("cuda", "xpu"):
         return
-    if not torch.cuda.is_available():
-        return
-    num_devices = torch.cuda.device_count()
+
+    num_devices = 0
+    if device_type == "cuda":
+        if not torch.cuda.is_available(): return
+        num_devices = torch.cuda.device_count()
+    elif device_type == "xpu":
+        if not (hasattr(torch, "xpu") and torch.xpu.is_available()): return
+        num_devices = torch.xpu.device_count()
+
     if num_devices <= 1:
-        print0(f"[nanochat] Detected {num_devices} CUDA device(s); staying in single-GPU mode.")
+        print0(f"[nanochat] Detected {num_devices} {device_type.upper()} device(s); staying in single-GPU mode.")
         return
 
     main_module = sys.modules.get("__main__")
@@ -193,16 +209,18 @@ def maybe_launch_multi_gpu(preferred_device_type=""):
     launch_cmd = cmd + entrypoint + additional_args
 
     os.environ["NANOCHAT_AUTO_DDP_LAUNCHED"] = "1"
-    print0(f"[nanochat] Detected {num_devices} CUDA devices; re-launching with multi-GPU.")
+    print0(f"[nanochat] Detected {num_devices} {device_type.upper()} devices; re-launching with multi-GPU.")
     print0(f"[nanochat] Launch command: {' '.join(launch_cmd)}")
     os.execv(launch_cmd[0], launch_cmd)
 
-def compute_init(device_type="cuda"): # cuda|cpu|mps
+def compute_init(device_type="cuda"): # cuda|xpu|mps|cpu
     """Basic initialization that we keep doing over and over, so make common."""
 
-    assert device_type in ["cuda", "mps", "cpu"], "Invalid device type atm"
+    assert device_type in ["cuda", "xpu", "mps", "cpu"], "Invalid device type atm"
     if device_type == "cuda":
         assert torch.cuda.is_available(), "Your PyTorch installation is not configured for CUDA but device_type is 'cuda'"
+    if device_type == "xpu":
+        assert hasattr(torch, "xpu") and torch.xpu.is_available(), "Your PyTorch installation is not configured for XPU but device_type is 'xpu'"
     if device_type == "mps":
         assert torch.backends.mps.is_available(), "Your PyTorch installation is not configured for MPS but device_type is 'mps'"
 
@@ -210,6 +228,8 @@ def compute_init(device_type="cuda"): # cuda|cpu|mps
     torch.manual_seed(42)
     if device_type == "cuda":
         torch.cuda.manual_seed(42)
+    elif device_type == "xpu":
+        torch.xpu.manual_seed(42)
     # skipping full reproducibility for now, possibly investigate slowdown later
     # torch.use_deterministic_algorithms(True)
 
@@ -217,12 +237,16 @@ def compute_init(device_type="cuda"): # cuda|cpu|mps
     if device_type == "cuda":
         torch.set_float32_matmul_precision("high") # uses tf32 instead of fp32 for matmuls
 
-    # Distributed setup: Distributed Data Parallel (DDP), optional, and requires CUDA
+    # Distributed setup: Distributed Data Parallel (DDP)
     ddp, ddp_rank, ddp_local_rank, ddp_world_size = get_dist_info()
-    if ddp and device_type == "cuda":
-        device = torch.device("cuda", ddp_local_rank)
-        torch.cuda.set_device(device) # make "cuda" default to this device
-        dist.init_process_group(backend="nccl", device_id=device)
+    if ddp and (device_type == "cuda" or device_type == "xpu"):
+        device = torch.device(device_type, ddp_local_rank)
+        if device_type == "cuda":
+            torch.cuda.set_device(device) # make "cuda" default to this device
+            dist.init_process_group(backend="nccl", device_id=device)
+        elif device_type == "xpu":
+            torch.xpu.set_device(device)
+            dist.init_process_group(backend="ccl", device_id=device)
         dist.barrier()
     else:
         device = torch.device(device_type) # mps|cpu

@@ -22,11 +22,19 @@ if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
   HAVE_NVIDIA=1
 fi
 
+HAVE_XPU=0
+if python -c "import torch; import intel_extension_for_pytorch; assert torch.xpu.is_available()" >/dev/null 2>&1; then
+  HAVE_XPU=1
+fi
+
 if [ "${HAVE_NVIDIA}" -eq 1 ]; then
   NGPUS=$(nvidia-smi -L | wc -l)
   NGPUS=$(echo "${NGPUS}" | xargs) # trim
+elif [ "${HAVE_XPU}" -eq 1 ]; then
+  NGPUS=$(python -c "import torch; import intel_extension_for_pytorch; print(torch.xpu.device_count())")
 else
   NGPUS=1
+  # Assuming CPU, but script below might fail if it strictly expects GPU for probing
 fi
 echo "Detected ${NGPUS} GPUs."
 
@@ -76,14 +84,18 @@ python -m scripts.tok_eval
 
 echo "=== Probing maximum depth/seq-len/dbsz based on available VRAM ==="
 
-if [ "${HAVE_NVIDIA}" -ne 1 ]; then
-  echo "No NVIDIA GPU detected. This script implementation requires NVIDIA GPUs."
+if [ "${HAVE_NVIDIA}" -ne 1 ] && [ "${HAVE_XPU}" -ne 1 ]; then
+  echo "No NVIDIA or Intel Arc GPU detected. This script implementation requires GPUs."
   exit 1
 fi
 
 # Detect VRAM of the first GPU (assuming homogeneous cluster for now)
 # Unit: MiB
-GPU_VRAM_MIB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -n 1)
+if [ "${HAVE_NVIDIA}" -eq 1 ]; then
+  GPU_VRAM_MIB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -n 1)
+elif [ "${HAVE_XPU}" -eq 1 ]; then
+  GPU_VRAM_MIB=$(python -c "import torch; import intel_extension_for_pytorch; print(int(torch.xpu.get_device_properties(0).total_memory / 1024 / 1024))")
+fi
 echo "Detected VRAM per GPU: ${GPU_VRAM_MIB} MiB"
 
 # Define Candidate Lists based on VRAM Scale
@@ -141,6 +153,7 @@ try_probe () {
     --eval_every=999999 \
     --sample_every=999999 \
     --core_metric_every=999999 \
+
     --eval_tokens=2048 \
     >/dev/null 2>&1
 }
@@ -194,7 +207,12 @@ EVAL_TOKENS=4096
 BASE_ITERS=8000
 
 echo "=== FINAL CONFIG (Auto-Detected) ==="
-echo "GPU info:       $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | head -n 1) x ${NGPUS}"
+if [ "${HAVE_NVIDIA}" -eq 1 ]; then
+    GPU_INFO=$(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | head -n 1)
+elif [ "${HAVE_XPU}" -eq 1 ]; then
+    GPU_INFO=$(python -c "import torch; import intel_extension_for_pytorch; print(f'{torch.xpu.get_device_name(0)}, {int(torch.xpu.get_device_properties(0).total_memory/1024/1024)} MiB')")
+fi
+echo "GPU info:       ${GPU_INFO} x ${NGPUS}"
 echo "DEPTH:          ${BEST_DEPTH}"
 echo "SEQ_LEN:        ${BEST_SEQLEN}"
 echo "DEVICE_BATCH:   ${BEST_DBSZ}"
