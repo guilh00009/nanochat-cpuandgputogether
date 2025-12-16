@@ -22,7 +22,7 @@ if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
 fi
 
 HAVE_XPU=0
-if python -c "import torch; assert torch.xpu.is_available()" >/dev/null 2>&1; then
+if python -c "import torch; try: assert torch.xpu.is_available(); except: exit(1)" >/dev/null 2>&1; then
   HAVE_XPU=1
 fi
 
