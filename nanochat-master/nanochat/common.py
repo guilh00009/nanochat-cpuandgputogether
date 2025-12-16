@@ -17,6 +17,11 @@ try:
 except ImportError:
     pass
 
+try:
+    import oneccl_bindings_for_pytorch
+except ImportError:
+    pass
+
 class ColoredFormatter(logging.Formatter):
     """Custom formatter that adds colors to log messages."""
     # ANSI color codes
